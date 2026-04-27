@@ -6,5 +6,9 @@ vcpkg/
 vcpkg_installed/
 
 *.exe
+
 .DS_Store
+
 cmd/app
+
+dist/
