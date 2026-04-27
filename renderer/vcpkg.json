@@ -1,0 +1,11 @@
+{
+  "name": "arc-renderer",
+  "version-semver": "0.1.0",
+  "description": "Native renderer subprocess for the Arc framework",
+  "dependencies": [
+    {
+      "name": "webview2",
+      "platform": "windows"
+    }
+  ]
+}
