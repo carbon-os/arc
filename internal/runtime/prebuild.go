@@ -16,17 +16,17 @@ import (
 )
 
 const (
-	rendererVersion = "v0.1.4"
+	rendererVersion = "v1.0.0"
 	baseURL         = "https://github.com/carbon-os/arc/releases/download/"
 )
 
 // checksums should now map to the SHA256 of the *archives* (.zip or .tar.gz)
 var checksums = map[string]string{
-	"darwin/amd64":  "...",
-	"darwin/arm64":  "...",
-	"linux/amd64":   "...",
-	"linux/arm64":   "...",
-	"windows/amd64": "...",
+	"darwin/amd64":  "",
+	"darwin/arm64":  "",
+	"linux/amd64":   "",
+	"linux/arm64":   "",
+	"windows/amd64": "", // Add your v1.0.0 zip sha256 here if you'd like
 }
 
 // EnsureRenderer guarantees the renderer binary and its dependencies are
@@ -72,9 +72,9 @@ func CachedDir() (string, error) {
 
 func rendererBinary() string {
 	if runtime.GOOS == "windows" {
-		return "arc-renderer.exe"
+		return "renderer.exe"
 	}
-	return "arc-renderer"
+	return "renderer"
 }
 
 // syncLocalRenderer copies the local dev binary and DLLs into the cache.
@@ -166,7 +166,7 @@ func downloadAndExtract(destDir string) (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("arc: download HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("arc: download HTTP %d (%s)", resp.StatusCode, url)
 	}
 
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
@@ -249,7 +249,7 @@ func extractZipFile(f *zip.File, destDir string) error {
 	defer rc.Close()
 
 	mode := f.Mode()
-	if strings.HasSuffix(cleanName, ".exe") {
+	if strings.HasSuffix(cleanName, ".exe") || cleanName == "renderer" {
 		mode = 0o755
 	}
 
@@ -305,7 +305,7 @@ func extractTarGz(tarPath, destDir string) error {
 			}
 
 			mode := header.FileInfo().Mode()
-			if cleanName == "arc-renderer" {
+			if cleanName == "renderer" {
 				mode = 0o755 // ensure executable permissions
 			}
 

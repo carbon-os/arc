@@ -5,56 +5,63 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
-	"debug/elf"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
 
 const (
-	rendererWinPath   = "../renderer/build/bin/Release/renderer.exe"
-	rendererUnixPath  = "../renderer/build/bin/renderer"
-	webView2NuGetURL  = "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2"
+	webview2Version   = "146.0.3856.97"
+	webview2PackageID = "WebView2.Runtime.X64"
+	webview2NuGetBase = "https://www.nuget.org/api/v2/package/"
+
+	distDir = "dist"
 )
 
 func main() {
-	log.SetFlags(0)
-	log.Printf("Starting prebuild packager for %s/%s...", runtime.GOOS, runtime.GOARCH)
+	if len(os.Args) < 3 {
+		log.Fatalf("Usage: go run prebuild.go <os> <arch>\nExample: go run prebuild.go windows amd64")
+	}
+	targetOS := strings.ToLower(os.Args[1])
+	targetArch := strings.ToLower(os.Args[2])
 
-	if err := os.MkdirAll("dist", 0o755); err != nil {
-		log.Fatalf("failed to create dist directory: %v", err)
+	if err := os.MkdirAll(distDir, 0755); err != nil {
+		log.Fatalf("Failed to create dist dir: %v", err)
 	}
 
-	var err error
-	switch runtime.GOOS {
+	fmt.Printf("Packaging release for %s/%s...\n", targetOS, targetArch)
+
+	switch targetOS {
 	case "windows":
-		err = packageWindows()
-	case "linux":
-		err = packageLinux()
-	case "darwin":
-		err = packageDarwin()
+		if err := packageWindows(targetArch); err != nil {
+			log.Fatalf("Windows packaging failed: %v", err)
+		}
+	case "darwin", "linux":
+		if err := packageUnix(targetOS, targetArch); err != nil {
+			log.Fatalf("%s packaging failed: %v", targetOS, err)
+		}
 	default:
-		log.Fatalf("unsupported OS for prebuild: %s", runtime.GOOS)
+		log.Fatalf("Unsupported OS: %s", targetOS)
 	}
 
-	if err != nil {
-		log.Fatalf("❌ Build failed: %v", err)
-	}
-	log.Println("✅ Prebuild complete!")
+	fmt.Println("Done! Ready for GitHub Releases.")
 }
 
-// ── Windows ──────────────────────────────────────────────────────────────────
+// ── Windows (.zip with WebView2) ──────────────────────────────────────────────
 
-func packageWindows() error {
-	outName := fmt.Sprintf("dist/prebuild-win-%s.zip", runtime.GOARCH)
-	log.Printf("Packaging %s...", outName)
+func packageWindows(arch string) error {
+	zipName := fmt.Sprintf("prebuild-win-%s.zip", arch)
+	outPath := filepath.Join(distDir, zipName)
 
-	outFile, err := os.Create(outName)
+	// Adjust these paths to match your CMake output for Windows
+	rendererPath := "../renderer/build/bin/Debug/renderer.exe"
+	loaderPath := "../renderer/build/bin/Debug/WebView2Loader.dll"
+
+	outFile, err := os.Create(outPath)
 	if err != nil {
 		return err
 	}
@@ -63,197 +70,81 @@ func packageWindows() error {
 	zw := zip.NewWriter(outFile)
 	defer zw.Close()
 
-	if err := addFileToZip(zw, rendererWinPath, "arc-renderer.exe"); err != nil {
-		return fmt.Errorf("adding renderer: %w", err)
+	fmt.Println(" -> Adding renderer.exe")
+	if err := addFileToZip(zw, rendererPath, "renderer.exe"); err != nil {
+		return fmt.Errorf("renderer.exe: %w", err)
 	}
 
-	log.Println("Downloading WebView2 NuGet package...")
-	resp, err := http.Get(webView2NuGetURL)
+	fmt.Println(" -> Adding WebView2Loader.dll")
+	if err := addFileToZip(zw, loaderPath, "WebView2Loader.dll"); err != nil {
+		return fmt.Errorf("WebView2Loader.dll: %w", err)
+	}
+
+	fmt.Println(" -> Fetching and bundling WebView2 Runtime...")
+	if err := bundleWebView2(zw); err != nil {
+		return fmt.Errorf("webview2 bundle: %w", err)
+	}
+
+	fmt.Printf("Created: %s\n", outPath)
+	return nil
+}
+
+func bundleWebView2(zw *zip.Writer) error {
+	url := webview2NuGetBase + webview2PackageID + "/" + webview2Version
+	resp, err := http.Get(url)
 	if err != nil {
-		return fmt.Errorf("downloading webview2: %w", err)
+		return err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	nugetBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
 
-	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	zr, err := zip.NewReader(bytes.NewReader(nugetBytes), int64(len(nugetBytes)))
 	if err != nil {
-		return fmt.Errorf("reading nuget zip: %w", err)
+		return err
 	}
 
-	archDir := "x64"
-	if runtime.GOARCH == "arm64" {
-		archDir = "arm64"
+	prefix := findWebView2Prefix(zr)
+	if prefix == "" {
+		return fmt.Errorf("msedgewebview2.exe not found in nuget package")
 	}
-	targetDll := fmt.Sprintf("build/native/%s/WebView2Loader.dll", archDir)
 
-	found := false
 	for _, f := range zr.File {
-		if strings.EqualFold(f.Name, targetDll) {
-			log.Printf("Extracting %s from bundle...", f.Name)
-			rc, err := f.Open()
-			if err != nil {
-				return err
-			}
-			defer rc.Close()
-
-			w, err := zw.Create("WebView2Loader.dll")
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(w, rc); err != nil {
-				return err
-			}
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		return fmt.Errorf("WebView2Loader.dll not found in NuGet package for arch %s", archDir)
-	}
-
-	return nil
-}
-
-// ── Linux ────────────────────────────────────────────────────────────────────
-
-func packageLinux() error {
-	outName := fmt.Sprintf("dist/prebuild-linux-%s.tar.gz", runtime.GOARCH)
-	log.Printf("Packaging %s...", outName)
-
-	outFile, err := os.Create(outName)
-	if err != nil {
-		return err
-	}
-	defer outFile.Close()
-
-	gw := gzip.NewWriter(outFile)
-	defer gw.Close()
-	tw := tar.NewWriter(gw)
-	defer tw.Close()
-
-	if err := addFileToTar(tw, rendererUnixPath, "arc-renderer"); err != nil {
-		return fmt.Errorf("adding renderer: %w", err)
-	}
-
-	log.Println("Resolving shared libraries via pure-Go ELF parser...")
-	deps, err := resolveElfDependencies(rendererUnixPath)
-	if err != nil {
-		return fmt.Errorf("failed to parse elf dependencies: %w", err)
-	}
-
-	for _, dep := range deps {
-		// Safety check: Avoid bundling core libc/ld.so as they are heavily tied
-		// to the host system kernel and glibc version.
-		if strings.Contains(dep, "libc.so") || strings.Contains(dep, "ld-linux") {
+		if !strings.HasPrefix(f.Name, prefix) || f.FileInfo().IsDir() {
 			continue
 		}
 
-		base := filepath.Base(dep)
-		log.Printf("  -> bundling %s", base)
-		if err := addFileToTar(tw, dep, base); err != nil {
-			log.Printf("warning: failed to bundle %s: %v", dep, err)
+		relPath := f.Name[len(prefix):]
+		if relPath == "" {
+			continue
+		}
+
+		destName := filepath.ToSlash(filepath.Join("webview2", relPath))
+		w, err := zw.Create(destName)
+		if err != nil {
+			return err
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+
+		_, err = io.Copy(w, rc)
+		rc.Close()
+		if err != nil {
+			return err
 		}
 	}
-
 	return nil
 }
-
-// resolveElfDependencies uses debug/elf to recursively find all shared
-// library dependencies (.so) for a given binary, replicating 'ldd' natively.
-func resolveElfDependencies(binPath string) ([]string, error) {
-	visited := make(map[string]bool)
-	var result []string
-
-	// Common Linux library search paths
-	searchPaths := []string{
-		"/lib/x86_64-linux-gnu",
-		"/usr/lib/x86_64-linux-gnu",
-		"/lib/aarch64-linux-gnu",
-		"/usr/lib/aarch64-linux-gnu",
-		"/lib64",
-		"/usr/lib64",
-		"/lib",
-		"/usr/lib",
-	}
-
-	var walk func(path string)
-	walk = func(path string) {
-		if visited[path] {
-			return
-		}
-		visited[path] = true
-
-		f, err := elf.Open(path)
-		if err != nil {
-			return // Skip if we can't open/parse it
-		}
-		defer f.Close()
-
-		imported, err := f.ImportedLibraries()
-		if err != nil {
-			return
-		}
-
-		for _, libName := range imported {
-			if strings.HasPrefix(libName, "linux-vdso") {
-				continue // Virtual kernel object, doesn't exist on disk
-			}
-
-			// Find the absolute path of the library
-			foundPath := ""
-			for _, searchDir := range searchPaths {
-				candidate := filepath.Join(searchDir, libName)
-				if _, err := os.Stat(candidate); err == nil {
-					foundPath = candidate
-					break
-				}
-			}
-
-			if foundPath != "" {
-				if !visited[foundPath] {
-					result = append(result, foundPath)
-					walk(foundPath) // Recurse into the dependency
-				}
-			} else {
-				log.Printf("  [!] warning: could not resolve path for %s", libName)
-			}
-		}
-	}
-
-	walk(binPath)
-	return result, nil
-}
-
-// ── macOS ────────────────────────────────────────────────────────────────────
-
-func packageDarwin() error {
-	outName := fmt.Sprintf("dist/prebuild-mac-%s.tar.gz", runtime.GOARCH)
-	log.Printf("Packaging %s...", outName)
-
-	outFile, err := os.Create(outName)
-	if err != nil {
-		return err
-	}
-	defer outFile.Close()
-
-	gw := gzip.NewWriter(outFile)
-	defer gw.Close()
-	tw := tar.NewWriter(gw)
-	defer tw.Close()
-
-	if err := addFileToTar(tw, rendererUnixPath, "arc-renderer"); err != nil {
-		return fmt.Errorf("adding renderer: %w", err)
-	}
-
-	return nil
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
 
 func addFileToZip(zw *zip.Writer, srcPath, destName string) error {
 	f, err := os.Open(srcPath)
@@ -262,25 +153,64 @@ func addFileToZip(zw *zip.Writer, srcPath, destName string) error {
 	}
 	defer f.Close()
 
-	info, err := f.Stat()
-	if err != nil {
-		return err
-	}
-
-	header, err := zip.FileInfoHeader(info)
-	if err != nil {
-		return err
-	}
-	header.Name = destName
-	header.Method = zip.Deflate
-
-	w, err := zw.CreateHeader(header)
+	w, err := zw.Create(destName)
 	if err != nil {
 		return err
 	}
 
 	_, err = io.Copy(w, f)
 	return err
+}
+
+func findWebView2Prefix(zr *zip.Reader) string {
+	candidates := []string{
+		"WebView2/",
+		"content/WebView2/",
+		"contentFiles/any/any/WebView2/",
+	}
+	for _, prefix := range candidates {
+		for _, f := range zr.File {
+			if strings.EqualFold(f.Name, prefix+"msedgewebview2.exe") {
+				return prefix
+			}
+		}
+	}
+	return ""
+}
+
+// ── Mac & Linux (.tar.gz) ─────────────────────────────────────────────────────
+
+func packageUnix(osName, arch string) error {
+	osPrefix := osName
+	if osName == "darwin" {
+		osPrefix = "mac"
+	}
+
+	tarName := fmt.Sprintf("prebuild-%s-%s.tar.gz", osPrefix, arch)
+	outPath := filepath.Join(distDir, tarName)
+
+	// Adjust this path to match your CMake output for Unix
+	rendererPath := "../renderer/build/bin/renderer"
+
+	outFile, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+
+	gw := gzip.NewWriter(outFile)
+	defer gw.Close()
+
+	tw := tar.NewWriter(gw)
+	defer tw.Close()
+
+	fmt.Println(" -> Adding renderer binary")
+	if err := addFileToTar(tw, rendererPath, "renderer"); err != nil {
+		return fmt.Errorf("renderer: %w", err)
+	}
+
+	fmt.Printf("Created: %s\n", outPath)
+	return nil
 }
 
 func addFileToTar(tw *tar.Writer, srcPath, destName string) error {
@@ -290,18 +220,20 @@ func addFileToTar(tw *tar.Writer, srcPath, destName string) error {
 	}
 	defer f.Close()
 
-	info, err := f.Stat()
+	stat, err := f.Stat()
 	if err != nil {
 		return err
 	}
 
-	header, err := tar.FileInfoHeader(info, info.Name())
+	hdr, err := tar.FileInfoHeader(stat, "")
 	if err != nil {
 		return err
 	}
-	header.Name = destName
+	
+	hdr.Name = destName
+	hdr.Mode = 0755 // Ensure it remains executable when extracted
 
-	if err := tw.WriteHeader(header); err != nil {
+	if err := tw.WriteHeader(hdr); err != nil {
 		return err
 	}
 
