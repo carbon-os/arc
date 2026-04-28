@@ -7,21 +7,54 @@ import (
 	"github.com/carbon-os/arc"
 	"github.com/carbon-os/arc/billing"
 	"github.com/carbon-os/arc/ipc"
+	"github.com/carbon-os/arc/packaging"
 	"github.com/carbon-os/arc/window"
 )
 
 func main() {
 	app := arc.NewApp(arc.AppConfig{
-		Title:   "Carbon AI",
+		Title:   "Sample App",
 		Logging: true,
 		Renderer: arc.RendererConfig{
 			Path: rendererPath(),
+		},
+
+		Package: packaging.PackagingConfig{
+			OutDir: "dist",
+
+			MacOS: &packaging.MacOSPackage{
+				BundleID: "com.sample.app",
+				Version:  "1.0.0",
+				Build:    "1",
+				MinMacOS: "13.0",
+				TeamID:   "sample-team-id",
+				SignCert: "Developer ID Application: Sample Inc",
+				IAP: &packaging.IAPConfig{
+					SubscriptionGroups: []packaging.SubscriptionGroup{
+						{
+							ID:   "sample-group-id",
+							Name: "Plus",
+							Subscriptions: []packaging.Subscription{
+								{
+									InternalID:   "sample-internal-id",
+									ProductID:    "plus.0001",
+									ReferenceName: "Plus Monthly",
+									DisplayName:  "Sample App Plus",
+									Description:  "Unlock all premium features.",
+									DisplayPrice: "9.99",
+									Period:       "P1M",
+								},
+							},
+						},
+					},
+				},
+			},
 		},
 	})
 
 	app.OnReady(func() {
 		win := app.NewBrowserWindow(window.Config{
-			Title:  "Carbon AI",
+			Title:  "Sample App",
 			Width:  800,
 			Height: 560,
 			Debug:  true,
@@ -31,7 +64,7 @@ func main() {
 			b, err := win.NewBilling(billing.Config{
 				Products: []billing.Product{
 					{
-						ID:   "carbon.ai.plus.0001",
+						ID:   "com.sample.app.plus.0001",
 						Kind: billing.Subscription,
 					},
 				},
@@ -69,7 +102,7 @@ func main() {
 			ipcMain := win.IPC()
 
 			ipcMain.On("billing:buy", func(_ ipc.Message) {
-				b.Buy("carbon.ai.plus.0001")
+				b.Buy("com.sample.app.plus.0001")
 			})
 
 			ipcMain.On("billing:restore", func(_ ipc.Message) {
@@ -77,7 +110,7 @@ func main() {
 			})
 
 			ipcMain.On("billing:check", func(_ ipc.Message) {
-				if b.IsActive("carbon.ai.plus.0001") {
+				if b.IsActive("com.sample.app.plus.0001") {
 					win.IPC().Send("billing:status", "active")
 				} else {
 					win.IPC().Send("billing:status", "inactive")
@@ -104,7 +137,7 @@ const billingHTML = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Carbon AI</title>
+  <title>Sample App</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -146,7 +179,7 @@ const billingHTML = `<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h1>Carbon AI Plus</h1>
+  <h1>Sample App Plus</h1>
   <p>Unlock all premium features.</p>
   <div id="price">Loading price…</div>
 
