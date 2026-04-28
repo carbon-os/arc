@@ -4,7 +4,6 @@ import (
 	"log"
 	"sync"
 
-	"github.com/carbon-os/arc/packaging"
 	"github.com/carbon-os/arc/window"
 )
 
@@ -26,10 +25,6 @@ type AppConfig struct {
 	Port     int
 	Logging  bool
 	Renderer RendererConfig
-
-	// Package declares distribution targets built when --package is passed.
-	// A zero value means packaging is disabled — no overhead at runtime.
-	Package packaging.PackagingConfig
 }
 
 // App is the top-level handle for an Arc application.
@@ -94,25 +89,9 @@ func (a *App) NewBrowserWindow(cfg window.Config) *window.BrowserWindow {
 
 // Run starts the application and blocks until all windows are closed.
 //
-// If --package or --package=<target> is passed on the command line, Run
-// delegates entirely to the packaging pipeline and returns once all targets
-// are built — the renderer process is never spawned.
-//
 // OnReady is called synchronously so all NewBrowserWindow calls and their
 // wg.Add(1) registrations complete before wg.Wait() is reached.
 func (a *App) Run() error {
-	// Intercept --package / --package=<target> / --skip-sign before
-	// touching any renderer or window state.
-	if targets, opts, ok := packaging.ParseFlags(); ok {
-		return packaging.Build(
-			a.cfg.Package,
-			a.cfg.Title,
-			a.cfg.Renderer.Path,
-			targets,
-			opts,
-		)
-	}
-
 	if a.cfg.WebApp {
 		a.mu.Lock()
 		readyCb := a.onReady

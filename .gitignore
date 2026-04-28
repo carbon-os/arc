@@ -12,3 +12,5 @@ vcpkg_installed/
 cmd/app
 
 dist/
+
+cmd/dev

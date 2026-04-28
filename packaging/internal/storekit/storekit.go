@@ -41,8 +41,6 @@ type SimpleProduct struct {
 	DisplayPrice  string
 }
 
-func HasProducts(iap interface{ hasProducts() bool }) bool { return iap.hasProducts() }
-
 // HasProducts reports whether any products are declared.
 func HasProductsIn(iap IAPConfig) bool {
 	return len(iap.SubscriptionGroups) > 0 ||

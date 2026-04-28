@@ -7,7 +7,6 @@ import (
 	"github.com/carbon-os/arc"
 	"github.com/carbon-os/arc/billing"
 	"github.com/carbon-os/arc/ipc"
-	"github.com/carbon-os/arc/packaging"
 	"github.com/carbon-os/arc/window"
 )
 
@@ -17,38 +16,6 @@ func main() {
 		Logging: true,
 		Renderer: arc.RendererConfig{
 			Path: rendererPath(),
-		},
-
-		Package: packaging.PackagingConfig{
-			OutDir: "dist",
-
-			MacOS: &packaging.MacOSPackage{
-				BundleID: "com.sample.app",
-				Version:  "1.0.0",
-				Build:    "1",
-				MinMacOS: "13.0",
-				TeamID:   "sample-team-id",
-				SignCert: "Developer ID Application: Sample Inc",
-				IAP: &packaging.IAPConfig{
-					SubscriptionGroups: []packaging.SubscriptionGroup{
-						{
-							ID:   "sample-group-id",
-							Name: "Plus",
-							Subscriptions: []packaging.Subscription{
-								{
-									InternalID:   "sample-internal-id",
-									ProductID:    "plus.0001",
-									ReferenceName: "Plus Monthly",
-									DisplayName:  "Sample App Plus",
-									Description:  "Unlock all premium features.",
-									DisplayPrice: "9.99",
-									Period:       "P1M",
-								},
-							},
-						},
-					},
-				},
-			},
 		},
 	})
 

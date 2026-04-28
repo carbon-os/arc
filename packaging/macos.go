@@ -29,8 +29,8 @@ func buildMacOS(cfg PackagingConfig, appName string, opts BuildOptions) error {
 
 	bundleName := appName + ".app"
 	bundlePath := filepath.Join(cfg.OutDir, bundleName)
-	macosDir   := filepath.Join(bundlePath, "Contents", "MacOS")
-	resDir     := filepath.Join(bundlePath, "Contents", "Resources")
+	macosDir := filepath.Join(bundlePath, "Contents", "MacOS")
+	resDir := filepath.Join(bundlePath, "Contents", "Resources")
 
 	// ── Scaffold ──────────────────────────────────────────────────────────
 	step("  cleaning previous build")
@@ -86,11 +86,14 @@ func buildMacOS(cfg PackagingConfig, appName string, opts BuildOptions) error {
 	}
 
 	// ── StoreKit ──────────────────────────────────────────────────────────
-	if mac.IAP != nil && storekit.HasProducts(mac.IAP) {
-		skPath := filepath.Join(cfg.OutDir, appName+".storekit")
-		step("  generating .storekit → %s", filepath.Base(skPath))
-		if err := storekit.Write(skPath, toStorekitIAP(mac.IAP)); err != nil {
-			return err
+	if mac.IAP != nil {
+		skIAP := toStorekitIAP(mac.IAP)
+		if storekit.HasProductsIn(skIAP) {
+			skPath := filepath.Join(cfg.OutDir, appName+".storekit")
+			step("  generating .storekit → %s", filepath.Base(skPath))
+			if err := storekit.Write(skPath, skIAP); err != nil {
+				return err
+			}
 		}
 	}
 

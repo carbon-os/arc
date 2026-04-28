@@ -1,0 +1,38 @@
+{
+  "appName": "Sample App",
+  "package": {
+    "outDir": "dist",
+    "binaryPath": "./sample-app",
+    "rendererBuildDir": "../../renderer/build/bin",
+    "macos": {
+      "bundleID": "com.sample.app",
+      "version": "1.0.0",
+      "build": "1",
+      "minMacOS": "13.0",
+      "teamID": "ABCDE12345",
+      "signCert": "Apple Development: Your Name",
+      "iap": {
+        "configIdentifier": "00000000",
+        "subscriptionGroups": [
+          {
+            "id": "SUBGROUP1",
+            "name": "Plus Subscriptions",
+            "subscriptions": [
+              {
+                "internalID": "00000001",
+                "productID": "com.sample.app.plus.0001",
+                "referenceName": "Plus Monthly",
+                "displayName": "Sample App Plus",
+                "description": "Unlock all premium features.",
+                "displayPrice": "9.99",
+                "period": "P1M",
+                "familyShareable": false,
+                "groupNumber": 1
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}
