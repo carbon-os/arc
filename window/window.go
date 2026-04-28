@@ -28,6 +28,7 @@ type Config struct {
 type BrowserWindow struct {
 	cfg     Config
 	rt      *runtime.Runtime
+	logging bool
 	ipcObj  *ipc.IPC
 	ipcOnce sync.Once
 	mu      sync.Mutex
@@ -46,10 +47,8 @@ func New(cfg Config, rendererCfg RendererConfig) *BrowserWindow {
 		cfg.Height = 800
 	}
 
-	w := &BrowserWindow{cfg: cfg}
+	w := &BrowserWindow{cfg: cfg, logging: rendererCfg.Logging}
 
-	// runtime.New is cheap — just struct allocation, no process yet.
-	// We create it here so IPC handlers can be registered before Run fires.
 	rt, _ := runtime.New(runtime.Config{
 		Title:        cfg.Title,
 		Width:        cfg.Width,
@@ -91,7 +90,7 @@ func (w *BrowserWindow) Run() error {
 // call; the same instance is returned on every subsequent call.
 func (w *BrowserWindow) IPC() *ipc.IPC {
 	w.ipcOnce.Do(func() {
-		w.ipcObj = ipc.New(w.rt)
+		w.ipcObj = ipc.New(w.rt, w.logging)
 	})
 	return w.ipcObj
 }
