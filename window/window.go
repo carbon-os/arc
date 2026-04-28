@@ -8,6 +8,7 @@ import (
 )
 
 // RendererConfig is forwarded from AppConfig to each window's renderer process.
+// Logging is carried here from AppConfig.Logging — not set directly by callers.
 type RendererConfig struct {
 	Path     string
 	Prebuilt bool

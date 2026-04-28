@@ -15,11 +15,6 @@ type RendererConfig struct {
 	// Prebuilt enables automatic download of the renderer binary from
 	// GitHub Releases when no cached binary exists. Ignored if Path is set.
 	Prebuilt bool
-
-	// Logging enables verbose renderer logging by passing --logging to the
-	// renderer process. All renderer log lines are prefixed with [INFO],
-	// [WARN], or [ERROR] and written to stderr.
-	Logging bool
 }
 
 // AppConfig is the top-level application configuration passed to NewApp.
@@ -28,6 +23,7 @@ type AppConfig struct {
 	WebApp   bool
 	Host     string
 	Port     int
+	Logging  bool
 	Renderer RendererConfig
 }
 
@@ -77,14 +73,13 @@ func (a *App) NewBrowserWindow(cfg window.Config) *window.BrowserWindow {
 	win := window.New(cfg, window.RendererConfig{
 		Path:     a.cfg.Renderer.Path,
 		Prebuilt: a.cfg.Renderer.Prebuilt,
-		Logging:  a.cfg.Renderer.Logging,
+		Logging:  a.cfg.Logging,
 	})
 
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
 		if err := win.Run(); err != nil {
-			// Actually log the error so we aren't flying blind!
 			log.Printf("[arc] window run error: %v", err)
 		}
 	}()

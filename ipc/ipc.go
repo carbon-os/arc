@@ -28,22 +28,23 @@ func (m Message) Bytes() []byte { return m.data }
 // IPC is the messaging handle for a single BrowserWindow.
 // Obtain one via win.IPC() — do not construct directly.
 type IPC struct {
-	rt *runtime.Runtime
+	rt  *runtime.Runtime
+	log *log.Logger
 }
 
 // New creates an IPC handle backed by the given runtime.
 // Called by BrowserWindow.IPC() — do not call directly.
-func New(rt *runtime.Runtime) *IPC {
-	return &IPC{rt: rt}
+func New(rt *runtime.Runtime, logging bool) *IPC {
+	return &IPC{rt: rt, log: runtime.NewLogger(logging)}
 }
 
 // On registers a handler for inbound messages on the named channel.
 // Replaces any previously registered handler for that channel.
 // Handlers are called on a dedicated goroutine.
 func (c *IPC) On(channel string, fn func(Message)) {
-	log.Printf("[go] ipc.On: registering channel=%q", channel)
+	c.log.Printf("[go] ipc.On: registering channel=%q", channel)
 	c.rt.OnMessage(channel, func(text string, data []byte, binary bool) {
-		log.Printf("[go] ipc: handler fired channel=%q binary=%v", channel, binary)
+		c.log.Printf("[go] ipc: handler fired channel=%q binary=%v", channel, binary)
 		if binary {
 			fn(Message{data: data, binary: true})
 		} else {
@@ -60,7 +61,7 @@ func (c *IPC) Off(channel string) {
 // Send delivers a UTF-8 string to the named channel in JavaScript.
 // Safe to call from any goroutine.
 func (c *IPC) Send(channel, text string) {
-	log.Printf("[go] ipc.Send: channel=%q text=%q", channel, text)
+	c.log.Printf("[go] ipc.Send: channel=%q text=%q", channel, text)
 	payload := append(runtime.EncodeStr(channel), runtime.EncodeStr(text)...)
 	c.rt.Send(runtime.CmdPostText, payload)
 }
@@ -68,7 +69,7 @@ func (c *IPC) Send(channel, text string) {
 // SendBytes delivers a binary message to the named channel in JavaScript.
 // Safe to call from any goroutine.
 func (c *IPC) SendBytes(channel string, data []byte) {
-	log.Printf("[go] ipc.SendBytes: channel=%q bytes=%d", channel, len(data))
+	c.log.Printf("[go] ipc.SendBytes: channel=%q bytes=%d", channel, len(data))
 	payload := append(runtime.EncodeStr(channel), data...)
 	c.rt.Send(runtime.CmdPostBinary, payload)
 }

@@ -31,6 +31,7 @@ type MessageHandler func(text string, data []byte, binary bool)
 // Each BrowserWindow owns exactly one Runtime.
 type Runtime struct {
 	cfg       Config
+	log       *log.Logger
 	transport *Transport
 	conn      net.Conn
 	cmd       *exec.Cmd
@@ -58,6 +59,7 @@ func New(cfg Config) (*Runtime, error) {
 	}
 	return &Runtime{
 		cfg:      cfg,
+		log:      NewLogger(cfg.Logging),
 		handlers: make(map[string]MessageHandler),
 		quit:     make(chan struct{}),
 	}, nil
@@ -98,79 +100,79 @@ func (rt *Runtime) Run() error {
 		)
 	}
 
-	log.Printf("[go] Run: spawning renderer %s %v", rendererPath, args)
+	rt.log.Printf("[go] Run: spawning renderer %s %v", rendererPath, args)
 
 	if err := rt.cmd.Start(); err != nil {
 		return fmt.Errorf("arc: start renderer: %w", err)
 	}
 
-	log.Println("[go] Run: waiting for renderer to connect...")
+	rt.log.Println("[go] Run: waiting for renderer to connect...")
 
 	if err := transport.Accept(); err != nil {
 		return fmt.Errorf("arc: renderer did not connect: %w", err)
 	}
 	rt.conn = transport.Conn()
 
-	log.Println("[go] Run: renderer connected, sending WindowCreate")
+	rt.log.Println("[go] Run: renderer connected, sending WindowCreate")
 
 	if err := rt.sendWindowCreate(); err != nil {
 		return fmt.Errorf("arc: WindowCreate: %w", err)
 	}
 
-	log.Println("[go] Run: entering event loop")
+	rt.log.Println("[go] Run: entering event loop")
 	return rt.loop()
 }
 
 func (rt *Runtime) loop() error {
-	log.Println("[go] loop: starting")
+	rt.log.Println("[go] loop: starting")
 	r := bufio.NewReader(rt.conn)
 	for {
 		evt, err := ReadEvent(r)
 		if err != nil {
 			select {
 			case <-rt.quit:
-				log.Println("[go] loop: quit signalled, exiting cleanly")
+				rt.log.Println("[go] loop: quit signalled, exiting cleanly")
 				return nil
 			default:
 				if err == io.EOF {
-					log.Println("[go] loop: EOF — renderer closed connection")
+					rt.log.Println("[go] loop: EOF — renderer closed connection")
 					return nil
 				}
-				log.Printf("[go] loop: read error: %v", err)
+				rt.log.Printf("[go] loop: read error: %v", err)
 				return fmt.Errorf("arc: read event: %w", err)
 			}
 		}
 
-		log.Printf("[go] loop: received event type=0x%02X", evt.Type)
+		rt.log.Printf("[go] loop: received event type=0x%02X", evt.Type)
 
 		switch evt.Type {
 		case evtReady:
-			log.Println("[go] loop: evtReady — firing OnReady callback")
+			rt.log.Println("[go] loop: evtReady — firing OnReady callback")
 			if rt.cfg.OnReady != nil {
 				go rt.cfg.OnReady()
 			}
 
 		case evtClosed:
-			log.Println("[go] loop: evtClosed — calling OnClose")
+			rt.log.Println("[go] loop: evtClosed — calling OnClose")
 			allow := true
 			if rt.cfg.OnClose != nil {
 				allow = rt.cfg.OnClose()
 			}
-			log.Printf("[go] loop: evtClosed allow=%v", allow)
+			rt.log.Printf("[go] loop: evtClosed allow=%v", allow)
 			if allow {
 				return nil
 			}
 
 		case evtIpcText:
-			log.Printf("[go] loop: evtIpcText channel=%q text=%q", evt.Channel, evt.Text)
+			rt.log.Printf("[go] loop: evtIpcText channel=%q text=%q", evt.Channel, evt.Text)
 			go rt.dispatch(evt.Channel, evt.Text, nil, false)
 
 		case evtIpcBinary:
-			log.Printf("[go] loop: evtIpcBinary channel=%q bytes=%d", evt.Channel, len(evt.Data))
+			rt.log.Printf("[go] loop: evtIpcBinary channel=%q bytes=%d", evt.Channel, len(evt.Data))
 			go rt.dispatch(evt.Channel, "", evt.Data, true)
 
 		default:
-			log.Printf("[go] loop: unknown event type=0x%02X — ignoring", evt.Type)
+			rt.log.Printf("[go] loop: unknown event type=0x%02X — ignoring", evt.Type)
 		}
 	}
 }
@@ -179,7 +181,7 @@ func (rt *Runtime) dispatch(channel, text string, data []byte, binary bool) {
 	rt.handlersMu.RLock()
 	h, ok := rt.handlers[channel]
 	rt.handlersMu.RUnlock()
-	log.Printf("[go] dispatch: channel=%q handlerFound=%v", channel, ok)
+	rt.log.Printf("[go] dispatch: channel=%q handlerFound=%v", channel, ok)
 	if ok {
 		h(text, data, binary)
 	}
@@ -190,12 +192,12 @@ func (rt *Runtime) Send(typ CmdByte, payload []byte) {
 	rt.writeMu.Lock()
 	defer rt.writeMu.Unlock()
 	if rt.conn == nil {
-		log.Printf("[go] Send: conn is nil, dropping cmd=0x%02X", typ)
+		rt.log.Printf("[go] Send: conn is nil, dropping cmd=0x%02X", typ)
 		return
 	}
-	log.Printf("[go] Send: cmd=0x%02X payload=%d bytes", typ, len(payload))
+	rt.log.Printf("[go] Send: cmd=0x%02X payload=%d bytes", typ, len(payload))
 	if err := WriteFrame(rt.conn, typ, payload); err != nil {
-		log.Printf("[go] Send: WriteFrame error: %v", err)
+		rt.log.Printf("[go] Send: WriteFrame error: %v", err)
 	}
 }
 
@@ -203,7 +205,7 @@ func (rt *Runtime) Send(typ CmdByte, payload []byte) {
 // Safe to call from any goroutine; idempotent.
 func (rt *Runtime) Quit() {
 	rt.once.Do(func() {
-		log.Println("[go] Quit: signalling quit and sending CmdQuit")
+		rt.log.Println("[go] Quit: signalling quit and sending CmdQuit")
 		close(rt.quit)
 		rt.Send(CmdQuit, nil)
 	})
@@ -214,7 +216,7 @@ func (rt *Runtime) OnMessage(channel string, h MessageHandler) {
 	rt.handlersMu.Lock()
 	rt.handlers[channel] = h
 	rt.handlersMu.Unlock()
-	log.Printf("[go] OnMessage: registered channel=%q", channel)
+	rt.log.Printf("[go] OnMessage: registered channel=%q", channel)
 }
 
 // OffMessage removes the handler for the named channel.
@@ -222,7 +224,7 @@ func (rt *Runtime) OffMessage(channel string) {
 	rt.handlersMu.Lock()
 	delete(rt.handlers, channel)
 	rt.handlersMu.Unlock()
-	log.Printf("[go] OffMessage: removed channel=%q", channel)
+	rt.log.Printf("[go] OffMessage: removed channel=%q", channel)
 }
 
 func (rt *Runtime) sendWindowCreate() error {
@@ -231,7 +233,7 @@ func (rt *Runtime) sendWindowCreate() error {
 		rt.cfg.Debug, rt.cfg.Title)
 	rt.writeMu.Lock()
 	defer rt.writeMu.Unlock()
-	log.Printf("[go] sendWindowCreate: %dx%d debug=%v title=%q",
+	rt.log.Printf("[go] sendWindowCreate: %dx%d debug=%v title=%q",
 		rt.cfg.Width, rt.cfg.Height, rt.cfg.Debug, rt.cfg.Title)
 	return WriteFrame(rt.conn, CmdWindowCreate, payload)
 }
