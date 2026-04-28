@@ -5,7 +5,6 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
-
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -14,10 +13,8 @@
 
 static uint32_t le32_dec(const uint8_t* p)
 {
-    return  (uint32_t)p[0]
-          | ((uint32_t)p[1] <<  8)
-          | ((uint32_t)p[2] << 16)
-          | ((uint32_t)p[3] << 24);
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 static void le32_enc(std::vector<uint8_t>& v, uint32_t n)
@@ -44,10 +41,8 @@ static std::vector<uint8_t> make_frame(const std::vector<uint8_t>& payload)
     return frame;
 }
 
-// ── fd ↔ void* packing ────────────────────────────────────────────────────────
-
-static void* fd_pack(int fd)   { return reinterpret_cast<void*>(static_cast<intptr_t>(fd + 1)); }
-static int   fd_unpack(void* p){ return static_cast<int>(reinterpret_cast<intptr_t>(p)) - 1; }
+static void* fd_pack(int fd)    { return reinterpret_cast<void*>(static_cast<intptr_t>(fd + 1)); }
+static int   fd_unpack(void* p) { return static_cast<int>(reinterpret_cast<intptr_t>(p)) - 1; }
 
 // ── HostChannel ───────────────────────────────────────────────────────────────
 
@@ -70,7 +65,6 @@ HostChannel::HostChannel(const std::string& path)
 
     pipe_ = fd_pack(fd);
     logger::Info("HostChannel: connected to unix socket %s", path.c_str());
-
     sender_thread_ = std::thread(&HostChannel::sender_loop, this);
 }
 
@@ -83,7 +77,6 @@ HostChannel::~HostChannel()
     queue_cv_.notify_all();
     if (sender_thread_.joinable())
         sender_thread_.join();
-
     if (pipe_) {
         ::close(fd_unpack(pipe_));
         pipe_ = nullptr;
@@ -93,8 +86,6 @@ HostChannel::~HostChannel()
 
 bool HostChannel::connected() const { return pipe_ != nullptr; }
 
-// ── Sender thread ─────────────────────────────────────────────────────────────
-
 void HostChannel::sender_loop()
 {
     logger::Info("HostChannel: sender thread started");
@@ -102,17 +93,11 @@ void HostChannel::sender_loop()
         std::vector<uint8_t> frame;
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
-            queue_cv_.wait(lock, [this] {
-                return stopping_ || !send_queue_.empty();
-            });
-            if (stopping_ && send_queue_.empty()) {
-                logger::Info("HostChannel: sender thread stopping");
-                return;
-            }
+            queue_cv_.wait(lock, [this] { return stopping_ || !send_queue_.empty(); });
+            if (stopping_ && send_queue_.empty()) return;
             frame = std::move(send_queue_.front());
             send_queue_.pop();
         }
-        logger::Info("HostChannel: sending frame %zu bytes", frame.size());
         write_raw(frame);
     }
 }
@@ -130,7 +115,6 @@ void HostChannel::write_raw(const std::vector<uint8_t>& frame)
 {
     int    fd      = fd_unpack(pipe_);
     size_t written = 0;
-
     while (written < frame.size()) {
         ssize_t n = ::write(fd, frame.data() + written, frame.size() - written);
         if (n < 0) {
@@ -140,23 +124,16 @@ void HostChannel::write_raw(const std::vector<uint8_t>& frame)
         }
         written += static_cast<size_t>(n);
     }
-    logger::Info("HostChannel: write_raw ok %zu bytes", written);
 }
-
-// ── Blocking read ─────────────────────────────────────────────────────────────
 
 bool HostChannel::read_exact(void* buf, uint32_t n)
 {
     int      fd  = fd_unpack(pipe_);
     auto*    p   = static_cast<uint8_t*>(buf);
     uint32_t got = 0;
-
     while (got < n) {
         ssize_t r = ::read(fd, p + got, n - got);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
+        if (r < 0) { if (errno == EINTR) continue; return false; }
         if (r == 0) return false;
         got += static_cast<uint32_t>(r);
     }
@@ -169,10 +146,7 @@ bool HostChannel::read_frame(InboundFrame& out)
     if (!read_exact(hdr, 4)) return false;
 
     uint32_t len = le32_dec(hdr);
-    if (len == 0) {
-        logger::Warn("HostChannel: received zero-length frame");
-        return false;
-    }
+    if (len == 0) { logger::Warn("HostChannel: zero-length frame"); return false; }
 
     std::vector<uint8_t> payload(len);
     if (!read_exact(payload.data(), len)) return false;
@@ -210,6 +184,7 @@ bool HostChannel::read_frame(InboundFrame& out)
     case Command::LoadURL:
     case Command::Eval:
     case Command::SetTitle:
+    case Command::BillingBuy:   // payload is just the product ID string
         out.str = read_str();
         break;
     case Command::SetSize:
@@ -224,10 +199,23 @@ bool HostChannel::read_frame(InboundFrame& out)
         out.channel = read_str();
         out.data.assign(p, end);
         break;
+    case Command::BillingInit: {
+        uint32_t count = read_u32();
+        out.billing_products.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            BillingProductDecl d;
+            d.id = read_str();
+            if (!need(1)) break;
+            d.kind = *p++;
+            out.billing_products.push_back(std::move(d));
+        }
+        break;
+    }
+    case Command::BillingRestore:
     case Command::Quit:
         break;
     default:
-        logger::Warn("HostChannel: unknown command byte 0x%02X",
+        logger::Warn("HostChannel: unknown command 0x%02X",
                      static_cast<uint8_t>(out.type));
         break;
     }
@@ -235,19 +223,16 @@ bool HostChannel::read_frame(InboundFrame& out)
     return true;
 }
 
-// ── Public sends ──────────────────────────────────────────────────────────────
+// ── Send helpers ──────────────────────────────────────────────────────────────
 
 void HostChannel::send_event(Event type)
 {
-    logger::Info("HostChannel: send_event 0x%02X", static_cast<uint8_t>(type));
-    std::vector<uint8_t> payload { static_cast<uint8_t>(type) };
+    std::vector<uint8_t> payload{ static_cast<uint8_t>(type) };
     enqueue(make_frame(payload));
 }
 
 void HostChannel::send_ipc_text(std::string_view channel, std::string_view text)
 {
-    logger::Info("HostChannel: send_ipc_text channel=%.*s",
-                 (int)channel.size(), channel.data());
     std::vector<uint8_t> payload;
     payload.reserve(1 + 4 + channel.size() + 4 + text.size());
     payload.push_back(static_cast<uint8_t>(Event::IpcText));
@@ -259,13 +244,41 @@ void HostChannel::send_ipc_text(std::string_view channel, std::string_view text)
 void HostChannel::send_ipc_binary(std::string_view channel,
                                    const std::vector<uint8_t>& data)
 {
-    logger::Info("HostChannel: send_ipc_binary channel=%.*s bytes=%zu",
-                 (int)channel.size(), channel.data(), data.size());
     std::vector<uint8_t> payload;
     payload.reserve(1 + 4 + channel.size() + data.size());
     payload.push_back(static_cast<uint8_t>(Event::IpcBinary));
     append_str(payload, channel);
     payload.insert(payload.end(), data.begin(), data.end());
+    enqueue(make_frame(payload));
+}
+
+void HostChannel::send_billing_products(const std::vector<BillingProductInfo>& products)
+{
+    logger::Info("HostChannel: send_billing_products count=%zu", products.size());
+    std::vector<uint8_t> payload;
+    payload.push_back(static_cast<uint8_t>(Event::BillingProducts));
+    le32_enc(payload, static_cast<uint32_t>(products.size()));
+    for (const auto& p : products) {
+        append_str(payload, p.id);
+        append_str(payload, p.title);
+        append_str(payload, p.description);
+        append_str(payload, p.formatted_price);
+        payload.push_back(p.kind);
+    }
+    enqueue(make_frame(payload));
+}
+
+void HostChannel::send_billing_purchase(PurchaseStatus status,
+                                         std::string_view product_id,
+                                         std::string_view error_msg)
+{
+    logger::Info("HostChannel: send_billing_purchase product=%.*s status=%d",
+                 (int)product_id.size(), product_id.data(), (int)status);
+    std::vector<uint8_t> payload;
+    payload.push_back(static_cast<uint8_t>(Event::BillingPurchase));
+    payload.push_back(static_cast<uint8_t>(status));
+    append_str(payload, product_id);
+    append_str(payload, error_msg);
     enqueue(make_frame(payload));
 }
 

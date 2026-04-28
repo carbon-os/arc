@@ -11,16 +11,16 @@ import (
 
 func main() {
 	app := arc.NewApp(arc.AppConfig{
-		Title: "Arc E2E",
+		Title: "Arc IPC",
+  	Logging: true,
 		Renderer: arc.RendererConfig{
-			Logging: true,
 			Path:    rendererPath(),
 		},
 	})
 
 	app.OnReady(func() {
 		win := app.NewBrowserWindow(window.Config{
-			Title:  "Arc E2E",
+			Title:  "Arc IPC",
 			Width:  900,
 			Height: 640,
 			Debug:  true,
@@ -70,7 +70,7 @@ const testHTML = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Arc E2E</title>
+  <title>Arc IPC</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {

@@ -1,11 +1,12 @@
 #include "host_channel.h"
+#include "billing.h"
 #include "logger.h"
 #include "browser/shared/webview.h"
 
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
-#include <vector>
 
 #ifndef _WIN32
 #  include <cstdlib>
@@ -67,6 +68,9 @@ int main(int argc, char** argv)
 
     browser::WebView wv(first.wc);
 
+    // Billing manager is created lazily when CmdBillingInit arrives.
+    std::unique_ptr<BillingManager> billing;
+
     wv.on_ready([&]() {
         logger::Info("renderer: ready");
         channel.send_event(Event::Ready);
@@ -74,12 +78,40 @@ int main(int argc, char** argv)
         std::thread([&]() {
             InboundFrame f;
             while (channel.read_frame(f)) {
-                if (f.type == Command::Quit) {
+                switch (f.type) {
+
+                case Command::Quit:
                     logger::Info("renderer: Quit received");
                     wv.quit();
                     return;
+
+                case Command::BillingInit:
+                    logger::Info("renderer: BillingInit — %zu product(s)",
+                                 f.billing_products.size());
+                    billing = std::make_unique<BillingManager>(channel);
+                    billing->init(f.billing_products);
+                    break;
+
+                case Command::BillingBuy:
+                    if (billing) {
+                        billing->buy(f.str);
+                    } else {
+                        logger::Warn("renderer: BillingBuy before BillingInit");
+                    }
+                    break;
+
+                case Command::BillingRestore:
+                    if (billing) {
+                        billing->restore();
+                    } else {
+                        logger::Warn("renderer: BillingRestore before BillingInit");
+                    }
+                    break;
+
+                default:
+                    wv.dispatch(std::move(f));
+                    break;
                 }
-                wv.dispatch(std::move(f));
             }
             logger::Warn("renderer: channel closed, quitting");
             wv.quit();

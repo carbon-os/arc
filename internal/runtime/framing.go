@@ -11,26 +11,55 @@ import (
 type CmdByte = uint8
 
 const (
-	CmdWindowCreate CmdByte = 0x01
-	CmdLoadFile     CmdByte = 0x02
-	CmdLoadHTML     CmdByte = 0x03
-	CmdLoadURL      CmdByte = 0x04
-	CmdEval         CmdByte = 0x05
-	CmdSetTitle     CmdByte = 0x06
-	CmdSetSize      CmdByte = 0x07
-	CmdPostText     CmdByte = 0x08
-	CmdPostBinary   CmdByte = 0x09
-	CmdQuit         CmdByte = 0x0A
+	CmdWindowCreate  CmdByte = 0x01
+	CmdLoadFile      CmdByte = 0x02
+	CmdLoadHTML      CmdByte = 0x03
+	CmdLoadURL       CmdByte = 0x04
+	CmdEval          CmdByte = 0x05
+	CmdSetTitle      CmdByte = 0x06
+	CmdSetSize       CmdByte = 0x07
+	CmdPostText      CmdByte = 0x08
+	CmdPostBinary    CmdByte = 0x09
+	CmdQuit          CmdByte = 0x0A
+	CmdBillingInit   CmdByte = 0x0B // payload: BillingProductDecl[]
+	CmdBillingBuy    CmdByte = 0x0C // payload: str(productID)
+	CmdBillingRestore CmdByte = 0x0D // no payload
 )
 
 type evtByte = uint8
 
 const (
-	evtReady     evtByte = 0x81
-	evtClosed    evtByte = 0x82
-	evtIpcText   evtByte = 0x83
-	evtIpcBinary evtByte = 0x84
+	evtReady           evtByte = 0x81
+	evtClosed          evtByte = 0x82
+	evtIpcText         evtByte = 0x83
+	evtIpcBinary       evtByte = 0x84
+	evtBillingProducts evtByte = 0x85 // store returned live product metadata
+	evtBillingPurchase evtByte = 0x86 // purchase lifecycle state transition
 )
+
+// ── Billing wire types ────────────────────────────────────────────────────────
+
+// BillingProductDecl is the outbound product declaration sent in CmdBillingInit.
+type BillingProductDecl struct {
+	ID   string
+	Kind uint8 // 0 = Subscription, 1 = OneTime
+}
+
+// BillingProduct is a decoded product entry from evtBillingProducts.
+type BillingProduct struct {
+	ID             string
+	Title          string
+	Description    string
+	FormattedPrice string
+	Kind           uint8
+}
+
+// BillingPurchaseEvent is the decoded payload from evtBillingPurchase.
+type BillingPurchaseEvent struct {
+	ProductID string
+	Status    uint8  // maps to billing.PurchaseStatus
+	ErrorMsg  string // non-empty only on failure
+}
 
 // ── Payload builders ──────────────────────────────────────────────────────────
 
@@ -64,6 +93,19 @@ func EncodeWindowCreate(width, height int, debug bool, title string) []byte {
 	return payload
 }
 
+// EncodeBillingInit builds the CmdBillingInit payload.
+//
+//	count:u32 [ id:str kind:u8 ] ...
+func EncodeBillingInit(products []BillingProductDecl) []byte {
+	buf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buf, uint32(len(products)))
+	for _, p := range products {
+		buf = append(buf, EncodeStr(p.ID)...)
+		buf = append(buf, p.Kind)
+	}
+	return buf
+}
+
 // ── Frame I/O ─────────────────────────────────────────────────────────────────
 
 // WriteFrame writes a length-prefixed frame to w:
@@ -73,7 +115,7 @@ func EncodeWindowCreate(width, height int, debug bool, title string) []byte {
 //
 // Not goroutine-safe on its own — callers must hold the write mutex.
 func WriteFrame(w io.Writer, typ CmdByte, payload []byte) error {
-	total := 1 + len(payload) // type byte + payload
+	total := 1 + len(payload)
 	hdr := make([]byte, 4)
 	binary.LittleEndian.PutUint32(hdr, uint32(total))
 
@@ -91,9 +133,13 @@ func WriteFrame(w io.Writer, typ CmdByte, payload []byte) error {
 // Event is a decoded inbound frame from the renderer.
 type Event struct {
 	Type    evtByte
+	// IPC fields
 	Channel string
 	Text    string
 	Data    []byte
+	// Billing fields
+	BillingProducts []BillingProduct
+	BillingPurchase BillingPurchaseEvent
 }
 
 // ReadEvent reads and decodes one inbound frame from r.
@@ -147,9 +193,51 @@ func ReadEvent(r io.Reader) (*Event, error) {
 		if evt.Channel, err = readStr(); err != nil {
 			return nil, err
 		}
-		// Remaining bytes are the binary payload.
 		evt.Data = make([]byte, len(cur))
 		copy(evt.Data, cur)
+
+	case evtBillingProducts:
+		if len(cur) < 4 {
+			return nil, fmt.Errorf("arc: evtBillingProducts truncated reading count")
+		}
+		count := binary.LittleEndian.Uint32(cur[:4])
+		cur = cur[4:]
+
+		evt.BillingProducts = make([]BillingProduct, 0, count)
+		for i := uint32(0); i < count; i++ {
+			var p BillingProduct
+			if p.ID, err = readStr(); err != nil {
+				return nil, err
+			}
+			if p.Title, err = readStr(); err != nil {
+				return nil, err
+			}
+			if p.Description, err = readStr(); err != nil {
+				return nil, err
+			}
+			if p.FormattedPrice, err = readStr(); err != nil {
+				return nil, err
+			}
+			if len(cur) < 1 {
+				return nil, fmt.Errorf("arc: evtBillingProducts truncated reading kind")
+			}
+			p.Kind = cur[0]
+			cur = cur[1:]
+			evt.BillingProducts = append(evt.BillingProducts, p)
+		}
+
+	case evtBillingPurchase:
+		if len(cur) < 1 {
+			return nil, fmt.Errorf("arc: evtBillingPurchase truncated reading status")
+		}
+		evt.BillingPurchase.Status = cur[0]
+		cur = cur[1:]
+		if evt.BillingPurchase.ProductID, err = readStr(); err != nil {
+			return nil, err
+		}
+		if evt.BillingPurchase.ErrorMsg, err = readStr(); err != nil {
+			return nil, err
+		}
 
 	default:
 		return nil, fmt.Errorf("arc: unknown event type 0x%02X", evt.Type)

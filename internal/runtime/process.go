@@ -27,6 +27,12 @@ type Config struct {
 // MessageHandler is the internal callback type used by the ipc package.
 type MessageHandler func(text string, data []byte, binary bool)
 
+// BillingProductsHandler is called when the renderer returns live product metadata.
+type BillingProductsHandler func([]BillingProduct)
+
+// BillingPurchaseHandler is called on every purchase lifecycle transition.
+type BillingPurchaseHandler func(BillingPurchaseEvent)
+
 // Runtime manages a single renderer subprocess and its IPC connection.
 // Each BrowserWindow owns exactly one Runtime.
 type Runtime struct {
@@ -41,12 +47,15 @@ type Runtime struct {
 	handlersMu sync.RWMutex
 	handlers   map[string]MessageHandler
 
+	billingMu              sync.RWMutex
+	billingProductsHandler BillingProductsHandler
+	billingPurchaseHandler BillingPurchaseHandler
+
 	quit chan struct{}
 	once sync.Once
 }
 
-// New creates a Runtime for the given config. Does not spawn the renderer —
-// call Run to do that. Cheap to call: no processes, no sockets, no I/O.
+// New creates a Runtime for the given config.
 func New(cfg Config) (*Runtime, error) {
 	if cfg.Width == 0 {
 		cfg.Width = 1280
@@ -171,6 +180,25 @@ func (rt *Runtime) loop() error {
 			rt.log.Printf("[go] loop: evtIpcBinary channel=%q bytes=%d", evt.Channel, len(evt.Data))
 			go rt.dispatch(evt.Channel, "", evt.Data, true)
 
+		case evtBillingProducts:
+			rt.log.Printf("[go] loop: evtBillingProducts count=%d", len(evt.BillingProducts))
+			rt.billingMu.RLock()
+			h := rt.billingProductsHandler
+			rt.billingMu.RUnlock()
+			if h != nil {
+				go h(evt.BillingProducts)
+			}
+
+		case evtBillingPurchase:
+			rt.log.Printf("[go] loop: evtBillingPurchase product=%q status=%d",
+				evt.BillingPurchase.ProductID, evt.BillingPurchase.Status)
+			rt.billingMu.RLock()
+			h := rt.billingPurchaseHandler
+			rt.billingMu.RUnlock()
+			if h != nil {
+				go h(evt.BillingPurchase)
+			}
+
 		default:
 			rt.log.Printf("[go] loop: unknown event type=0x%02X — ignoring", evt.Type)
 		}
@@ -211,7 +239,7 @@ func (rt *Runtime) Quit() {
 	})
 }
 
-// OnMessage registers an inbound message handler for the named channel.
+// OnMessage registers an inbound IPC message handler for the named channel.
 func (rt *Runtime) OnMessage(channel string, h MessageHandler) {
 	rt.handlersMu.Lock()
 	rt.handlers[channel] = h
@@ -225,6 +253,24 @@ func (rt *Runtime) OffMessage(channel string) {
 	delete(rt.handlers, channel)
 	rt.handlersMu.Unlock()
 	rt.log.Printf("[go] OffMessage: removed channel=%q", channel)
+}
+
+// OnBillingProducts registers the handler for evtBillingProducts.
+// Called by the billing package — do not call directly.
+func (rt *Runtime) OnBillingProducts(h BillingProductsHandler) {
+	rt.billingMu.Lock()
+	rt.billingProductsHandler = h
+	rt.billingMu.Unlock()
+	rt.log.Println("[go] OnBillingProducts: registered")
+}
+
+// OnBillingPurchase registers the handler for evtBillingPurchase.
+// Called by the billing package — do not call directly.
+func (rt *Runtime) OnBillingPurchase(h BillingPurchaseHandler) {
+	rt.billingMu.Lock()
+	rt.billingPurchaseHandler = h
+	rt.billingMu.Unlock()
+	rt.log.Println("[go] OnBillingPurchase: registered")
 }
 
 func (rt *Runtime) sendWindowCreate() error {

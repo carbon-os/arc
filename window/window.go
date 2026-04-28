@@ -3,6 +3,7 @@ package window
 import (
 	"sync"
 
+	"github.com/carbon-os/arc/billing"
 	"github.com/carbon-os/arc/ipc"
 	"github.com/carbon-os/arc/internal/runtime"
 )
@@ -29,8 +30,13 @@ type BrowserWindow struct {
 	cfg     Config
 	rt      *runtime.Runtime
 	logging bool
+
 	ipcObj  *ipc.IPC
 	ipcOnce sync.Once
+
+	billingMu  sync.Mutex
+	billingObj *billing.Billing
+
 	mu      sync.Mutex
 	onReady func()
 	onClose func() bool
@@ -93,6 +99,27 @@ func (w *BrowserWindow) IPC() *ipc.IPC {
 		w.ipcObj = ipc.New(w.rt, w.logging)
 	})
 	return w.ipcObj
+}
+
+// NewBilling creates and initialises the Billing handle for this window,
+// sending CmdBillingInit to the renderer subprocess to register products
+// with the platform's native store. Must be called from within OnReady.
+// Subsequent calls return the existing handle unchanged.
+func (w *BrowserWindow) NewBilling(cfg billing.Config) (*billing.Billing, error) {
+	w.billingMu.Lock()
+	defer w.billingMu.Unlock()
+
+	if w.billingObj != nil {
+		return w.billingObj, nil
+	}
+
+	b, err := billing.New(w.rt, cfg, w.logging)
+	if err != nil {
+		return nil, err
+	}
+
+	w.billingObj = b
+	return b, nil
 }
 
 // OnReady registers a callback that fires once this window's renderer is
