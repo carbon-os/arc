@@ -156,6 +156,19 @@ func stepGenerateProject(cfg *buildConfig) error {
 		ModuleName:     filepath.Base(cfg.moduleLib),
 		LoadModulePath: loadModulePath(filepath.Base(cfg.moduleLib)),
 		LibArcInclude:  "libarc/include",
+		MainFile:       "main.cpp",
+	}
+
+	// On macOS, use main.mm and inject the bundle ID so StoreKit has an
+	// identifier before it tries to talk to the store daemon.
+	mainTmpl := MainCppTmpl
+	if runtime.GOOS == "darwin" && cfg.arcJSON != "" {
+		if arcCfg, err := LoadArcConfig(cfg.arcJSON); err == nil &&
+			arcCfg.App != nil && arcCfg.App.BundleID != "" {
+			data.BundleID = arcCfg.App.BundleID
+			data.MainFile = "main.mm"
+			mainTmpl = MainMmTmpl
+		}
 	}
 
 	files := []struct {
@@ -163,7 +176,7 @@ func stepGenerateProject(cfg *buildConfig) error {
 		tmpl string
 	}{
 		{"CMakeLists.txt", CMakeListsTmpl},
-		{"main.cpp", MainCppTmpl},
+		{data.MainFile, mainTmpl},
 	}
 
 	for _, f := range files {

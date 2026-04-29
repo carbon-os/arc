@@ -23,17 +23,19 @@ type projectData struct {
 	ModuleName     string
 	LoadModulePath string
 	LibArcInclude  string
+	MainFile       string // "main.cpp" or "main.mm"
+	BundleID       string // empty on non-Apple or when not set
 }
 
 const CMakeListsTmpl = `cmake_minimum_required(VERSION 3.22)
-project({{.BinaryName}} LANGUAGES CXX)
+project({{.BinaryName}} LANGUAGES CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD          20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS        OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
-add_executable({{.BinaryName}} main.cpp)
+add_executable({{.BinaryName}} {{.MainFile}})
 
 target_include_directories({{.BinaryName}} PRIVATE
     "${CMAKE_SOURCE_DIR}/{{.LibArcInclude}}"
@@ -62,6 +64,21 @@ add_custom_command(TARGET {{.BinaryName}} POST_BUILD
         "$<TARGET_FILE_DIR:{{.BinaryName}}>/{{.ModuleName}}"
     COMMENT "Copying shared libraries alongside {{.BinaryName}}"
 )
+`
+
+// MainMmTmpl is used on macOS when arc.json supplies a bundle_id.
+// The NSBundle setValue:forKey: call gives StoreKit a bundle identifier
+// before arc::Run() touches the store daemon.
+const MainMmTmpl = `#include <arc/arc.h>
+#import <Foundation/Foundation.h>
+
+int main() {
+    [[NSBundle mainBundle] setValue:@"{{.BundleID}}"
+                             forKey:@"CFBundleIdentifier"];
+    arc::LoadModule("{{.LoadModulePath}}");
+    arc::Run();
+    return 0;
+}
 `
 
 const MainCppTmpl = `#include <arc/arc.h>
