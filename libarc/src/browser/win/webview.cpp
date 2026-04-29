@@ -7,6 +7,7 @@
 #include <WebView2EnvironmentOptions.h>
 #include <wrl/client.h>
 #include <wrl/event.h>
+#include <dwmapi.h>
 
 #include <cstdio>
 #include <sstream>
@@ -25,7 +26,8 @@ static constexpr UINT kMsgCommand = WM_APP + 2;
 
 WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
 {
-    impl_->owner = this;
+    impl_->owner         = this;
+    impl_->titlebar_style = cfg.titleBarStyle;
 
     HRESULT hr_com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(hr_com) && hr_com != S_FALSE && hr_com != RPC_E_CHANGED_MODE)
@@ -45,10 +47,25 @@ WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
         logger::Info("WebView: window class registered");
     }
 
+    // ── Window style ──────────────────────────────────────────────────────────
+    //
+    // Default: WS_OVERLAPPEDWINDOW — standard title bar + border.
+    //
+    // Hidden:  WS_THICKFRAME + WS_SYSMENU + WS_MINIMIZEBOX + WS_MAXIMIZEBOX
+    //          No WS_CAPTION — removes the title bar chrome.
+    //          WS_THICKFRAME keeps the DWM shadow and resize border.
+    //          WM_NCCALCSIZE in wnd_proc removes the residual 1px top line.
+
+    const bool hidden_bar = (cfg.titleBarStyle == TitleBarStyle::Hidden);
+
+    DWORD style = hidden_bar
+        ? (WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
+        : WS_OVERLAPPEDWINDOW;
+
     impl_->hwnd = CreateWindowExW(
         0, L"arc_renderer",
         win::to_wide(cfg.title).c_str(),
-        WS_OVERLAPPEDWINDOW,
+        style,
         CW_USEDEFAULT, CW_USEDEFAULT,
         cfg.width, cfg.height,
         nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -56,13 +73,23 @@ WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
     if (!impl_->hwnd)
         throw std::runtime_error("browser::WebView: CreateWindowEx failed");
 
-    logger::Info("WebView: window created %dx%d title=%s",
-                 cfg.width, cfg.height, cfg.title.c_str());
-
     SetWindowLongPtrW(impl_->hwnd, GWLP_USERDATA,
                       reinterpret_cast<LONG_PTR>(impl_));
+
+    // Extend the DWM frame so the shadow is preserved on the hidden-bar path.
+    // A 0-margin call on the default path is a no-op.
+    if (hidden_bar) {
+        MARGINS margins{ 0, 0, 1, 0 }; // 1px top lets DWM keep its shadow
+        DwmExtendFrameIntoClientArea(impl_->hwnd, &margins);
+        logger::Info("WebView: titleBarStyle=Hidden — DWM frame extended");
+    }
+
     ShowWindow(impl_->hwnd, SW_SHOW);
     UpdateWindow(impl_->hwnd);
+
+    logger::Info("WebView: window created %dx%d title=%s titleBarStyle=%d",
+                 cfg.width, cfg.height, cfg.title.c_str(),
+                 static_cast<int>(cfg.titleBarStyle));
 
     auto opts = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
 

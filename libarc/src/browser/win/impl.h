@@ -7,6 +7,7 @@
 #  define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <dwmapi.h>
 #include <wrl/client.h>
 #include <WebView2.h>
 
@@ -34,6 +35,9 @@ struct OutboundFrame {
 struct WebViewImpl {
     HWND     hwnd  = nullptr;
     WebView* owner = nullptr;
+
+    // Stored so wnd_proc can branch on it without capturing cfg.
+    TitleBarStyle titlebar_style = TitleBarStyle::Default;
 
     ComPtr<ICoreWebView2Environment> env;
     ComPtr<ICoreWebView2Controller>  controller;

@@ -11,19 +11,19 @@ import (
 type CmdByte = uint8
 
 const (
-	CmdWindowCreate  CmdByte = 0x01
-	CmdLoadFile      CmdByte = 0x02
-	CmdLoadHTML      CmdByte = 0x03
-	CmdLoadURL       CmdByte = 0x04
-	CmdEval          CmdByte = 0x05
-	CmdSetTitle      CmdByte = 0x06
-	CmdSetSize       CmdByte = 0x07
-	CmdPostText      CmdByte = 0x08
-	CmdPostBinary    CmdByte = 0x09
-	CmdQuit          CmdByte = 0x0A
-	CmdBillingInit   CmdByte = 0x0B // payload: BillingProductDecl[]
-	CmdBillingBuy    CmdByte = 0x0C // payload: str(productID)
-	CmdBillingRestore CmdByte = 0x0D // no payload
+	CmdWindowCreate   CmdByte = 0x01
+	CmdLoadFile       CmdByte = 0x02
+	CmdLoadHTML       CmdByte = 0x03
+	CmdLoadURL        CmdByte = 0x04
+	CmdEval           CmdByte = 0x05
+	CmdSetTitle       CmdByte = 0x06
+	CmdSetSize        CmdByte = 0x07
+	CmdPostText       CmdByte = 0x08
+	CmdPostBinary     CmdByte = 0x09
+	CmdQuit           CmdByte = 0x0A
+	CmdBillingInit    CmdByte = 0x0B
+	CmdBillingBuy     CmdByte = 0x0C
+	CmdBillingRestore CmdByte = 0x0D
 )
 
 type evtByte = uint8
@@ -33,8 +33,22 @@ const (
 	evtClosed          evtByte = 0x82
 	evtIpcText         evtByte = 0x83
 	evtIpcBinary       evtByte = 0x84
-	evtBillingProducts evtByte = 0x85 // store returned live product metadata
-	evtBillingPurchase evtByte = 0x86 // purchase lifecycle state transition
+	evtBillingProducts evtByte = 0x85
+	evtBillingPurchase evtByte = 0x86
+)
+
+// ── TitleBarStyle ─────────────────────────────────────────────────────────────
+
+// TitleBarStyle controls the appearance of the native window title bar.
+type TitleBarStyle uint8
+
+const (
+	// TitleBarDefault shows the standard OS title bar.
+	TitleBarDefault TitleBarStyle = 0
+
+	// TitleBarHidden hides the title bar while keeping the window border,
+	// shadow, resize handles, and traffic lights (macOS).
+	TitleBarHidden TitleBarStyle = 1
 )
 
 // ── Billing wire types ────────────────────────────────────────────────────────
@@ -57,8 +71,8 @@ type BillingProduct struct {
 // BillingPurchaseEvent is the decoded payload from evtBillingPurchase.
 type BillingPurchaseEvent struct {
 	ProductID string
-	Status    uint8  // maps to billing.PurchaseStatus
-	ErrorMsg  string // non-empty only on failure
+	Status    uint8
+	ErrorMsg  string
 }
 
 // ── Payload builders ──────────────────────────────────────────────────────────
@@ -81,8 +95,8 @@ func EncodeU32U32(a, b uint32) []byte {
 
 // EncodeWindowCreate builds the WindowCreate payload.
 //
-//	width:u32 height:u32 debug:u8 title:str
-func EncodeWindowCreate(width, height int, debug bool, title string) []byte {
+//	width:u32  height:u32  debug:u8  title:str  titleBarStyle:u8
+func EncodeWindowCreate(width, height int, debug bool, title string, titleBarStyle TitleBarStyle) []byte {
 	var debugByte byte
 	if debug {
 		debugByte = 1
@@ -90,6 +104,7 @@ func EncodeWindowCreate(width, height int, debug bool, title string) []byte {
 	payload := EncodeU32U32(uint32(width), uint32(height))
 	payload = append(payload, debugByte)
 	payload = append(payload, EncodeStr(title)...)
+	payload = append(payload, byte(titleBarStyle))
 	return payload
 }
 
@@ -133,11 +148,9 @@ func WriteFrame(w io.Writer, typ CmdByte, payload []byte) error {
 // Event is a decoded inbound frame from the renderer.
 type Event struct {
 	Type    evtByte
-	// IPC fields
 	Channel string
 	Text    string
 	Data    []byte
-	// Billing fields
 	BillingProducts []BillingProduct
 	BillingPurchase BillingPurchaseEvent
 }

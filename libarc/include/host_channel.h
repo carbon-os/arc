@@ -16,13 +16,21 @@
 #include <thread>
 #include <vector>
 
+// ── Title bar style ───────────────────────────────────────────────────────────
+
+enum class TitleBarStyle : uint8_t {
+    Default = 0,   // standard OS title bar
+    Hidden  = 1,   // hide title bar, keep border / shadow / traffic lights
+};
+
 // ── Window config (sent as first frame from Go) ───────────────────────────────
 
 struct WindowConfig {
-    int         width  = 1280;
-    int         height = 800;
-    bool        debug  = false;
-    std::string title;
+    int            width          = 1280;
+    int            height         = 800;
+    bool           debug          = false;
+    std::string    title;
+    TitleBarStyle  titleBarStyle  = TitleBarStyle::Default;
 };
 
 // ── Command bytes (Go → renderer) ────────────────────────────────────────────

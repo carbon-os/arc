@@ -65,16 +65,27 @@ WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
 
     // ── NSWindow ──────────────────────────────────────────────────────────────
 
+    const bool hidden_bar = (cfg.titleBarStyle == TitleBarStyle::Hidden);
+
     NSWindowStyleMask style = NSWindowStyleMaskTitled
                             | NSWindowStyleMaskClosable
                             | NSWindowStyleMaskResizable
                             | NSWindowStyleMaskMiniaturizable;
+
+    if (hidden_bar)
+        style |= NSWindowStyleMaskFullSizeContentView;
 
     impl_->window = [[NSWindow alloc]
                          initWithContentRect:frame
                                    styleMask:style
                                      backing:NSBackingStoreBuffered
                                        defer:NO];
+
+    if (hidden_bar) {
+        impl_->window.titleVisibility          = NSWindowTitleHidden;
+        impl_->window.titlebarAppearsTransparent = YES;
+        logger::Info("WebView: titleBarStyle=Hidden");
+    }
 
     [impl_->window setTitle:[NSString stringWithUTF8String:cfg.title.c_str()]];
     [impl_->window setContentView:impl_->webview];
@@ -88,8 +99,9 @@ WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
     [impl_->window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 
-    logger::Info("WebView: window created %dx%d title=%s",
-                 cfg.width, cfg.height, cfg.title.c_str());
+    logger::Info("WebView: window created %dx%d title=%s titleBarStyle=%d",
+                 cfg.width, cfg.height, cfg.title.c_str(),
+                 static_cast<int>(cfg.titleBarStyle));
 
     WebViewImpl* impl = impl_;
     dispatch_async(dispatch_get_main_queue(), ^{

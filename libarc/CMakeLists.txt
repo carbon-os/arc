@@ -89,6 +89,7 @@ if(WIN32)
     foreach(_target libarc arc-host)
         target_link_libraries(${_target} PRIVATE
             unofficial::webview2::webview2
+            dwmapi
             ole32 oleaut32 shlwapi version)
         target_compile_definitions(${_target} PRIVATE
             WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -116,7 +117,7 @@ elseif(APPLE)
         target_compile_options(${_target} PRIVATE -fobjc-arc)
     endforeach()
 
-    set_target_properties(libarc  PROPERTIES MACOSX_BUNDLE FALSE)
+    set_target_properties(libarc   PROPERTIES MACOSX_BUNDLE FALSE)
     set_target_properties(arc-host PROPERTIES MACOSX_BUNDLE FALSE)
 
 else()

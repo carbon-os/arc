@@ -24,8 +24,6 @@ static gboolean on_delete_event(GtkWidget*, GdkEvent*, gpointer user_data)
     return FALSE;
 }
 
-// Deferred on_ready — fires on the first main-loop iteration after construction
-// so that the caller has a chance to set callbacks before they trigger.
 static gboolean fire_ready(gpointer user_data)
 {
     auto* impl = static_cast<WebViewImpl*>(user_data);
@@ -39,7 +37,8 @@ static gboolean fire_ready(gpointer user_data)
 
 WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
 {
-    impl_->owner = this;
+    impl_->owner          = this;
+    impl_->titlebar_style = cfg.titleBarStyle;
 
     static bool gtk_inited = false;
     if (!gtk_inited) {
@@ -53,15 +52,11 @@ WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
 
     WebKitWebContext* context = webkit_web_context_new();
 
-    // Register ui-ipc:// scheme; user_data is impl_ (owned by this WebView).
     webkit_web_context_register_uri_scheme(
         context, "ui-ipc",
         handle_uri_scheme_request,
         impl_, nullptr);
 
-    // Mark the scheme as secure so fetch() works inside it.
-    // CORS registration is no longer needed — everything is same-origin
-    // under ui-ipc://app/ now that the binary-slot route moved there too.
     WebKitSecurityManager* sm = webkit_web_context_get_security_manager(context);
     webkit_security_manager_register_uri_scheme_as_secure(sm, "ui-ipc");
 
@@ -71,9 +66,6 @@ WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
 
     WebKitUserContentManager* manager = webkit_user_content_manager_new();
 
-    // Inject the IPC shim before any page script runs.
-    // JS→C++ messages now arrive via POST to ui-ipc://app/-/js/{verb}/{channel}
-    // so we no longer need the "ipc" webkit messageHandler or its signal.
     WebKitUserScript* shim_script = webkit_user_script_new(
         browser::gtk::k_shim,
         WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
@@ -107,6 +99,42 @@ WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
     gtk_window_set_default_size(GTK_WINDOW(impl_->window), cfg.width, cfg.height);
     gtk_container_add(GTK_CONTAINER(impl_->window), GTK_WIDGET(impl_->webview));
 
+    // ── Title bar style ───────────────────────────────────────────────────────
+    //
+    // TitleBarHidden on Linux uses gtk_window_set_titlebar() with a zero-height
+    // GtkBox. This tells GTK "the app owns the titlebar area" so GTK still
+    // draws the CSD border, shadow, and resize handles around the window, but
+    // shows no title bar chrome.
+    //
+    // This works reliably on Wayland and GNOME/Mutter where client-side
+    // decorations (CSD) are the norm. On X11 with a server-side decoration
+    // window manager (e.g. KDE/KWin, Openbox), the WM controls both the title
+    // bar and the border as a unit — the border may disappear along with the
+    // title bar on those desktops. We log a warning in that case so it is
+    // visible during development, but we do not attempt a WM-specific workaround
+    // since the correct fix is WM-dependent and out of scope for libarc.
+
+    if (cfg.titleBarStyle == TitleBarStyle::Hidden) {
+        GtkWidget* empty_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+        gtk_widget_set_size_request(empty_bar, -1, 0); // zero height
+        gtk_window_set_titlebar(GTK_WINDOW(impl_->window), empty_bar);
+
+        // Detect whether we are running under a server-side decoration WM.
+        // gtk_window_get_decorated() returns TRUE by default; after
+        // set_titlebar() GTK switches to CSD on compositors that support it.
+        // On pure X11/SSD desktops GDK_IS_X11_DISPLAY is true and there is
+        // no compositor hint — warn the developer.
+        GdkDisplay* display = gdk_display_get_default();
+        const bool  is_x11  = (display != nullptr) &&
+                               (g_strcmp0(G_OBJECT_TYPE_NAME(display), "GdkX11Display") == 0);
+        if (is_x11) {
+            logger::Warn("WebView: TitleBarHidden on X11 — border visibility "
+                         "depends on the window manager. Reliable on Wayland/GNOME.");
+        } else {
+            logger::Info("WebView: titleBarStyle=Hidden (CSD empty titlebar)");
+        }
+    }
+
     g_signal_connect(impl_->window, "delete-event",
                      G_CALLBACK(on_delete_event), impl_);
     g_signal_connect(impl_->window, "destroy",
@@ -114,8 +142,9 @@ WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
                      nullptr);
 
     gtk_widget_show_all(impl_->window);
-    logger::Info("WebView: window created %dx%d title=%s",
-                 cfg.width, cfg.height, cfg.title.c_str());
+    logger::Info("WebView: window created %dx%d title=%s titleBarStyle=%d",
+                 cfg.width, cfg.height, cfg.title.c_str(),
+                 static_cast<int>(cfg.titleBarStyle));
 
     g_idle_add(fire_ready, impl_);
 }

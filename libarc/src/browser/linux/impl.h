@@ -26,9 +26,12 @@ struct OutboundFrame {
 };
 
 struct WebViewImpl {
-    GtkWidget* window  = nullptr;
+    GtkWidget*     window  = nullptr;
     WebKitWebView* webview = nullptr;
-    WebView* owner   = nullptr;
+    WebView*       owner   = nullptr;
+
+    // Stored so window.cpp helpers can branch on it if needed later.
+    TitleBarStyle titlebar_style = TitleBarStyle::Default;
 
     WebView::ReadyCallback      on_ready_cb;
     WebView::ClosedCallback     on_closed_cb;

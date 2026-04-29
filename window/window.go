@@ -8,20 +8,34 @@ import (
 	"github.com/carbon-os/arc/internal/runtime"
 )
 
+// TitleBarStyle controls the appearance of the native window title bar.
+// Re-exported here so callers only need to import the window package.
+type TitleBarStyle = runtime.TitleBarStyle
+
+const (
+	// TitleBarDefault shows the standard OS title bar.
+	TitleBarDefault TitleBarStyle = runtime.TitleBarDefault
+
+	// TitleBarHidden hides the title bar while keeping the window border,
+	// shadow, resize handles, and traffic lights (macOS).
+	TitleBarHidden TitleBarStyle = runtime.TitleBarHidden
+)
+
 // RendererConfig is forwarded from AppConfig to each window's runtime.
 type RendererConfig struct {
 	Path      string
 	Prebuilt  bool
 	Logging   bool
-	ChannelID string // non-empty disables renderer spawning
+	ChannelID string
 }
 
 // Config holds the options for a new BrowserWindow.
 type Config struct {
-	Title  string
-	Width  int
-	Height int
-	Debug  bool
+	Title         string
+	Width         int
+	Height        int
+	Debug         bool
+	TitleBarStyle TitleBarStyle
 }
 
 // BrowserWindow is a handle to a native window and its dedicated renderer
@@ -57,14 +71,15 @@ func New(cfg Config, rendererCfg RendererConfig) *BrowserWindow {
 	w := &BrowserWindow{cfg: cfg, logging: rendererCfg.Logging}
 
 	rt, _ := runtime.New(runtime.Config{
-		Title:        cfg.Title,
-		Width:        cfg.Width,
-		Height:       cfg.Height,
-		Debug:        cfg.Debug,
-		RendererPath: rendererCfg.Path,
-		Prebuilt:     rendererCfg.Prebuilt,
-		Logging:      rendererCfg.Logging,
-		ChannelID:    rendererCfg.ChannelID,
+		Title:         cfg.Title,
+		Width:         cfg.Width,
+		Height:        cfg.Height,
+		Debug:         cfg.Debug,
+		TitleBarStyle: cfg.TitleBarStyle,
+		RendererPath:  rendererCfg.Path,
+		Prebuilt:      rendererCfg.Prebuilt,
+		Logging:       rendererCfg.Logging,
+		ChannelID:     rendererCfg.ChannelID,
 		OnReady: func() {
 			w.mu.Lock()
 			cb := w.onReady

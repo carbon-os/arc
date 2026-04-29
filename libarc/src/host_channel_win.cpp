@@ -198,10 +198,13 @@ bool HostChannel::read_frame(InboundFrame& out)
 
     switch (out.type) {
     case Command::WindowCreate:
-        out.wc.width  = static_cast<int>(read_u32());
-        out.wc.height = static_cast<int>(read_u32());
-        out.wc.debug  = (*p++ != 0);
-        out.wc.title  = read_str();
+        out.wc.width         = static_cast<int>(read_u32());
+        out.wc.height        = static_cast<int>(read_u32());
+        out.wc.debug         = (*p++ != 0);
+        out.wc.title         = read_str();
+        out.wc.titleBarStyle = need(1)
+            ? static_cast<TitleBarStyle>(*p++)
+            : TitleBarStyle::Default;
         break;
     case Command::LoadFile:
     case Command::LoadHTML:

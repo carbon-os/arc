@@ -13,19 +13,19 @@ import (
 
 // Config holds the parameters used when starting a renderer process.
 type Config struct {
-	Title        string
-	Width        int
-	Height       int
-	Debug        bool
-	Logging      bool
-	RendererPath string
-	Prebuilt     bool
-	OnReady      func()
-	OnClose      func() bool
+	Title         string
+	Width         int
+	Height        int
+	Debug         bool
+	Logging       bool
+	TitleBarStyle TitleBarStyle
+	RendererPath  string
+	Prebuilt      bool
+	OnReady       func()
+	OnClose       func() bool
 
 	// ChannelID, when non-empty, disables renderer spawning. Arc will connect
 	// to an already-running renderer on this channel instead of starting one.
-	// Populated automatically from --channel when main_process.mm is the parent.
 	ChannelID string
 }
 
@@ -81,11 +81,6 @@ func New(cfg Config) (*Runtime, error) {
 
 // Run connects to or spawns the renderer process, then blocks on the event
 // loop until the window is closed or Quit is called.
-//
-// When cfg.ChannelID is set (external renderer mode), Run connects to an
-// already-listening socket opened by main_process.mm — no subprocess is
-// started. When cfg.ChannelID is empty (self-spawn mode), Run resolves the
-// renderer binary, listens on a new socket, and spawns the renderer itself.
 func (rt *Runtime) Run() error {
 	wv2Path, err := EnsureWebView2()
 	if err != nil {
@@ -109,8 +104,6 @@ func (rt *Runtime) Run() error {
 		}
 
 	} else {
-		// ── Self-spawn mode (default) ─────────────────────────────────────────
-		// Go is the parent. Resolve the binary, open the socket, spawn renderer.
 		rendererPath, err := EnsureRenderer(rt.cfg.RendererPath, rt.cfg.Prebuilt)
 		if err != nil {
 			return err
@@ -303,10 +296,13 @@ func (rt *Runtime) OnBillingPurchase(h BillingPurchaseHandler) {
 func (rt *Runtime) sendWindowCreate() error {
 	payload := EncodeWindowCreate(
 		rt.cfg.Width, rt.cfg.Height,
-		rt.cfg.Debug, rt.cfg.Title)
+		rt.cfg.Debug, rt.cfg.Title,
+		rt.cfg.TitleBarStyle,
+	)
 	rt.writeMu.Lock()
 	defer rt.writeMu.Unlock()
-	rt.log.Printf("[go] sendWindowCreate: %dx%d debug=%v title=%q",
-		rt.cfg.Width, rt.cfg.Height, rt.cfg.Debug, rt.cfg.Title)
+	rt.log.Printf("[go] sendWindowCreate: %dx%d debug=%v title=%q titleBarStyle=%d",
+		rt.cfg.Width, rt.cfg.Height, rt.cfg.Debug, rt.cfg.Title,
+		rt.cfg.TitleBarStyle)
 	return WriteFrame(rt.conn, CmdWindowCreate, payload)
 }
