@@ -86,14 +86,14 @@ type buildConfig struct {
 	goFlags    []string // extra flags forwarded verbatim to go build
 	goPackage  string   // package argument, defaults to "."
 
-	wd             string // working directory at invocation time
-	projectDir     string // <wd>/arc-project/
-	arcRepoDir     string // <wd>/arc-project/arc-repo/         (full cloned repo)
-	libarcDir      string // <wd>/arc-project/arc-repo/libarc/  (C++ source)
-	libarcDestDir  string // <wd>/arc-project/libarc/           (copied out of repo)
-	moduleLib      string // <wd>/arc-project/libarc-module.{ext}
-	libarcLib      string // <wd>/arc-project/{libarc.dylib|libarc.so|arc.dll}
-	stubPath       string // <wd>/_arc_entry.go
+	wd            string // working directory at invocation time
+	projectDir    string // <wd>/arc-project/
+	arcRepoDir    string // <wd>/arc-project/arc-repo/
+	libarcDir     string // <wd>/arc-project/arc-repo/libarc/
+	libarcDestDir string // <wd>/arc-project/libarc/
+	moduleLib     string // <wd>/arc-project/libarc-module.{ext}
+	libarcLib     string // <wd>/arc-project/{libarc.dylib|libarc.so|arc.dll}
+	stubPath      string // <wd>/arc_entry_generated.go
 }
 
 func parseBuildArgs(args []string) (*buildConfig, error) {
@@ -129,7 +129,7 @@ func parseBuildArgs(args []string) (*buildConfig, error) {
 	cfg.libarcDestDir = filepath.Join(cfg.projectDir, "libarc")
 	cfg.moduleLib     = filepath.Join(cfg.projectDir, "libarc-module"+sharedExt())
 	cfg.libarcLib     = filepath.Join(cfg.projectDir, libarcFileName())
-	cfg.stubPath      = filepath.Join(wd, "_arc_entry.go")
+	cfg.stubPath      = filepath.Join(wd, "arc_entry_generated.go")
 
 	return cfg, nil
 }
@@ -234,13 +234,11 @@ func stepBuildLibarc(cfg *buildConfig) error {
 		return err
 	}
 
-	// Copy the built library to arc-project/
 	fmt.Printf("   copying %s → arc-project/%s\n", filepath.Base(built), filepath.Base(cfg.libarcLib))
 	if err := copyFile(built, cfg.libarcLib); err != nil {
 		return err
 	}
 
-	// Copy libarc/include → arc-project/libarc/include
 	srcInclude := filepath.Join(cfg.libarcDir, "include")
 	dstInclude := filepath.Join(cfg.libarcDestDir, "include")
 	fmt.Printf("   copying libarc/include → arc-project/libarc/include\n")
@@ -248,7 +246,6 @@ func stepBuildLibarc(cfg *buildConfig) error {
 		return fmt.Errorf("copy include: %w", err)
 	}
 
-	// Delete the repo — no longer needed
 	fmt.Printf("   removing arc-repo (no longer needed)\n")
 	return os.RemoveAll(cfg.arcRepoDir)
 }
@@ -294,12 +291,12 @@ func stepGoMod(cfg *buildConfig) error {
 // ── step 4: compile Go module as shared library ───────────────────────────────
 
 func stepCompileGoModule(cfg *buildConfig) error {
-	fmt.Printf("   injecting _arc_entry.go\n")
+	fmt.Printf("   injecting arc_entry_generated.go\n")
 	if err := os.WriteFile(cfg.stubPath, []byte(arcEntryStub), 0o644); err != nil {
 		return fmt.Errorf("write stub: %w", err)
 	}
 	defer func() {
-		fmt.Printf("   removing _arc_entry.go\n")
+		fmt.Printf("   removing arc_entry_generated.go\n")
 		os.Remove(cfg.stubPath)
 	}()
 
@@ -319,10 +316,10 @@ func stepCompileGoModule(cfg *buildConfig) error {
 
 type projectData struct {
 	BinaryName     string
-	LibArcName     string // e.g. "libarc.dylib"
-	ModuleName     string // e.g. "libarc-module.dylib"
-	LoadModulePath string // argument passed to arc::LoadModule
-	LibArcInclude  string // relative path from arc-project/ to libarc/include
+	LibArcName     string
+	ModuleName     string
+	LoadModulePath string
+	LibArcInclude  string
 }
 
 const cmakeListsTmpl = `cmake_minimum_required(VERSION 3.22)
