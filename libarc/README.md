@@ -277,7 +277,7 @@ sudo dnf install webkit2gtk4.1-devel gtk3-devel
 cd libarc
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 ```
 
 This produces two outputs:
