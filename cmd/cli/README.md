@@ -1,149 +1,158 @@
-# Arc CLI
+# arc CLI
 
-The Arc CLI is the standalone build and packaging tool for your Arc applications. It takes your compiled Go binary and C++ renderer, and bundles them into native, distributable packages for macOS, Windows, and Linux.
+The `arc` build tool for Arc applications. Handles everything needed to go
+from a Go source tree to a native, distributable host binary — without
+requiring a `git` binary or manual CMake setup.
 
 ## Installation
 
-To build the CLI tool from your project root:
+```bash
+go install github.com/carbon-os/arc/cmd/cli@latest
+```
+
+Or build from source in the repo root:
 
 ```bash
-go build -o arc cmd/cli/main.go
+go build -o arc ./cmd/cli
 ```
 
 ## Usage
 
-Run the `arc` binary in the directory containing your configuration file.
+```bash
+arc <command> [flags]
+```
+
+### Commands
+
+| Command | Description |
+| :--- | :--- |
+| `arc build` | Clone/update libarc, compile your Go module, generate and configure `arc-project/` |
+| `arc help` | Print usage information |
+
+---
+
+## `arc build`
 
 ```bash
-./arc [flags]
+arc build [-o name] [go-build-flags] [package]
 ```
 
-### Command Line Flags
+The only command you need for a production build. Runs the following steps in order:
 
-| Flag | Default | Description |
-| :--- | :--- | :--- |
-| `--config` | `arc.json` | Path to your configuration file. Useful for CI/CD or separate dev/prod configs. |
-| `--target` | (all configured) | Comma-separated list of targets to build (e.g., `macos`, `windows`, `linux`). If omitted, builds all platforms defined in the config. |
-| `--skip-sign` | `false` | Bypasses code signing for macOS and Windows. Use this for local testing to avoid certificate requirements. |
+**1. Clone or update libarc**
 
-**Examples:**
+Uses [go-git v5](https://github.com/go-git/go-git) — a pure Go git
+implementation bundled into the `arc` binary — to clone or update
+`https://github.com/carbon-os/arc` into `arc-project/libarc/`. No `git`
+binary is required on the host machine.
+
+**2. Build libarc with CMake**
+
+Configures and builds libarc in Release mode inside `arc-project/libarc/build/`,
+then copies the resulting shared library into `arc-project/`. On Windows,
+`VCPKG_ROOT` must be set.
+
+**3. Compile your Go module**
+
+Injects a temporary `_arc_entry.go` stub into your package, then calls
+`go build -buildmode=c-shared` to produce `arc-project/libarc-module.{ext}`.
+The stub exports `AppMain` — the symbol libarc calls in production mode. It
+is always removed after the build, even on failure.
+
+**4. Generate `arc-project/`**
+
+Writes a `CMakeLists.txt` and `main.cpp` alongside the compiled libraries.
+The `main.cpp` is identical on every platform and never needs to be edited.
+
+**5. Pre-configure the CMake build tree**
+
+Runs `cmake -B arc-project/build` so the project is ready to build or open
+in an IDE immediately.
+
+### Flags
+
+| Flag | Description |
+| :--- | :--- |
+| `-o name` | Name of the final host binary. Defaults to the current directory name. |
+
+Any other flags (e.g. `-race`, `-tags`) are forwarded verbatim to `go build`.
+
+### Examples
+
 ```bash
-# Build all platforms defined in arc.json
-./arc
+# Standard build
+arc build .
 
-# Build only for macOS and Linux
-./arc --target=macos,linux
+# Custom output binary name
+arc build -o myapp .
 
-# Build for Windows using a specific staging configuration, without signing
-./arc --config=arc.staging.json --target=windows --skip-sign
+# With extra go build flags
+arc build -race -o myapp .
+```
+
+### After running `arc build`
+
+```
+your-app/
+├── main.go                        ← your app, untouched
+├── go.mod
+│
+└── arc-project/
+    ├── CMakeLists.txt             ← auto-generated
+    ├── main.cpp                   ← auto-generated host entry point
+    ├── libarc-module.dylib        ← your compiled Go logic
+    ├── libarc.dylib               ← native webview + run loop
+    ├── libarc/                    ← full libarc source (for Xcode / debugging)
+    └── build/                     ← cmake build tree, configured and ready
+```
+
+To produce the final host binary:
+
+```bash
+cd arc-project && cmake --build build
+```
+
+Or open `arc-project/` directly in Xcode for a full native debug session with
+breakpoints, Instruments, and the memory graph.
+
+---
+
+## Platform requirements
+
+| Platform | Requirements |
+| :--- | :--- |
+| macOS | Xcode Command Line Tools, CMake ≥ 3.22 |
+| Windows | Visual Studio 2022, CMake ≥ 3.22, vcpkg (`VCPKG_ROOT` must be set) |
+| Linux | GCC or Clang, CMake ≥ 3.22, `libwebkit2gtk-4.1-dev`, `libgtk-3-dev` |
+
+On Linux, install the webview dependencies before running `arc build`:
+
+```bash
+# Debian / Ubuntu
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev
+
+# Fedora
+sudo dnf install webkit2gtk4.1-devel gtk3-devel
 ```
 
 ---
 
-## Configuration (`arc.json`)
+## Development vs production
 
-The CLI reads your packaging configuration from a JSON file (default: `arc.json`). This keeps your application's source code clean and devoid of build-time metadata.
+`arc build` is only needed to produce a distributable binary. During
+day-to-day development you don't use it at all:
 
-### Root Configuration
-
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `appName` | `string` | **Required.** The user-facing name of your application. |
-| `package` | `object` | **Required.** The packaging definitions. Contains the following sub-fields: |
-
-### `package` Object
-
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `outDir` | `string` | The directory where output bundles are saved. Defaults to `"dist"`. |
-| `binaryPath` | `string` | Path to the compiled Go executable. Defaults to the running executable if empty. |
-| `rendererBuildDir` | `string` | Path to the C++ renderer build output. Defaults to `"renderer/build/bin"`. |
-| `macos` | `object` | macOS packaging configuration. Omit to skip macOS builds. |
-| `windows` | `object` | Windows packaging configuration. Omit to skip Windows builds. |
-| `linux` | `object` | Linux packaging configuration. Omit to skip Linux builds. |
-
----
-
-### Platform: `macos`
-
-Produces a `.app` bundle.
-
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `bundleID` | `string` | **Required.** Reverse-DNS identifier (e.g., `"com.example.app"`). |
-| `version` | `string` | Short version string (e.g., `"1.2.0"`). Defaults to `"1.0.0"`. |
-| `build` | `string` | Build number (e.g., `"42"`). Defaults to `"1"`. |
-| `minMacOS` | `string` | Minimum supported OS version. Defaults to `"13.0"`. |
-| `teamID` | `string` | 10-character Apple Developer Team ID (Required for signing). |
-| `signCert` | `string` | Partial name of the certificate to use for codesign (Required for signing). |
-| `iap` | `object` | Optional. In-app purchase configuration for StoreKit sandbox testing. |
-
----
-
-### Platform: `windows`
-
-Produces an `.msix` package.
-
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `packageID` | `string` | Internal package identifier. Defaults to `appName` without spaces. |
-| `publisher` | `string` | Publisher string matching your signing certificate (e.g., `"CN=Acme Corp, O=Acme Corp, C=US"`). |
-| `version` | `string` | Four-part version string (e.g., `"1.2.0.0"`). Defaults to `"1.0.0.0"`. |
-| `displayName` | `string` | The name shown in the Start menu. Defaults to `appName`. |
-| `certPath` | `string` | Path to your `.pfx` signing certificate. |
-| `certPassword` | `string` | Password for the `.pfx` certificate. |
-
----
-
-### Platform: `linux`
-
-Produces `.deb` and/or `.AppImage` files.
-
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `name` | `string` | Internal package name (e.g., `"sample-app"`). Defaults to lowercase `appName`. |
-| `version` | `string` | Version string. Defaults to `"1.0.0"`. |
-| `maintainer` | `string` | Maintainer contact info (e.g., `"Jane Doe <jane@example.com>"`). |
-| `description` | `string` | Short description of the application. |
-| `homepage` | `string` | URL to the application's website. |
-| `deb` | `boolean` | Set to `true` to build a Debian `.deb` package. |
-| `appImage` | `boolean` | Set to `true` to build an AppImage. |
-
----
-
-## Example `arc.json`
-
-```json
-{
-  "appName": "Sample App",
-  "package": {
-    "outDir": "dist",
-    "binaryPath": "./bin/sample-app",
-    "rendererBuildDir": "renderer/build/bin",
-    "macos": {
-      "bundleID": "com.example.app",
-      "version": "1.2.0",
-      "build": "42",
-      "minMacOS": "13.0",
-      "teamID": "ABCDE12345",
-      "signCert": "Developer ID Application: Acme Corp"
-    },
-    "windows": {
-      "packageID": "SampleApp",
-      "publisher": "CN=Acme Corp, O=Acme Corp, C=US",
-      "version": "1.2.0.0",
-      "displayName": "Sample App",
-      "certPath": "./certs/win.pfx",
-      "certPassword": "super-secret-password"
-    },
-    "linux": {
-      "name": "sample-app",
-      "version": "1.2.0",
-      "maintainer": "Acme Corp <hello@example.com>",
-      "description": "An awesome sample desktop application.",
-      "deb": true,
-      "appImage": true
-    }
-  }
-}
+```bash
+go run .
 ```
+
+The Go arc package spawns the renderer as a subprocess and drives it over IPC.
+No CMake, no C compiler, no Xcode required.
+
+| | Development | Production |
+| :--- | :--- | :--- |
+| Command | `go run .` | `arc build` then `cmake --build` |
+| Process model | Two processes (Go + renderer) | Single process |
+| Build requirements | Go toolchain only | CMake, C++ compiler |
+| App Store / MSIX ready | No | Yes |
+| Sandbox safe | No | Yes |
