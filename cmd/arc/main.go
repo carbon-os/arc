@@ -146,6 +146,7 @@ func runBuild(args []string) error {
 	}{
 		{"cloning libarc", stepCloneLibarc},
 		{"building libarc", stepBuildLibarc},
+		{"resolving Go dependencies", stepGoMod},
 		{"compiling Go module", stepCompileGoModule},
 		{"generating arc-project", stepGenerateProject},
 		{"configuring cmake", stepConfigureCmake},
@@ -251,7 +252,29 @@ func findBuiltLibarc(buildDir string) (string, error) {
 		name, strings.Join(candidates, "\n  "))
 }
 
-// ── step 3: compile Go module as shared library ───────────────────────────────
+// ── step 3: ensure go.mod exists and dependencies are resolved ───────────────
+
+func stepGoMod(cfg *buildConfig) error {
+	goMod := filepath.Join(cfg.wd, "go.mod")
+	if _, err := os.Stat(goMod); os.IsNotExist(err) {
+		// Derive a simple module path from the binary name.
+		modulePath := "app/" + cfg.binaryName
+		fmt.Printf("   go mod init %s\n", modulePath)
+		if err := runCmd(cfg.wd, "go", "mod", "init", modulePath); err != nil {
+			return fmt.Errorf("go mod init: %w", err)
+		}
+	} else {
+		fmt.Printf("   go.mod already exists, skipping init\n")
+	}
+
+	fmt.Printf("   go mod tidy\n")
+	if err := runCmd(cfg.wd, "go", "mod", "tidy"); err != nil {
+		return fmt.Errorf("go mod tidy: %w", err)
+	}
+	return nil
+}
+
+// ── step 4: compile Go module as shared library ───────────────────────────────
 
 func stepCompileGoModule(cfg *buildConfig) error {
 	fmt.Printf("   injecting _arc_entry.go\n")
@@ -275,7 +298,7 @@ func stepCompileGoModule(cfg *buildConfig) error {
 	return runCmd(cfg.wd, "go", goArgs...)
 }
 
-// ── step 4: generate CMakeLists.txt and main.cpp ─────────────────────────────
+// ── step 5: generate CMakeLists.txt and main.cpp ─────────────────────────────
 
 type projectData struct {
 	BinaryName     string
@@ -379,7 +402,7 @@ func loadModulePath(moduleBase string) string {
 	}
 }
 
-// ── step 5: pre-configure the cmake build tree ───────────────────────────────
+// ── step 6: pre-configure the cmake build tree ───────────────────────────────
 
 func stepConfigureCmake(cfg *buildConfig) error {
 	buildDir := filepath.Join(cfg.projectDir, "build")
