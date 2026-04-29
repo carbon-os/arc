@@ -7,17 +7,17 @@ requiring a `git` binary or manual CMake setup.
 ## Installation
 
 ```bash
-go install github.com/carbon-os/arc/cmd/cli@latest
-export PATH="$PATH:$(go env GOPATH)/bin"
-
 GOPROXY=direct go install github.com/carbon-os/arc/cmd/arc@latest
+export PATH="$PATH:$(go env GOPATH)/bin"
 ```
 
 Or build from source in the repo root:
 
 ```bash
-go build -o arc ./cmd/cli
+go build -o arc ./cmd/arc
 ```
+
+---
 
 ## Usage
 
@@ -37,7 +37,7 @@ arc <command> [flags]
 ## `arc build`
 
 ```bash
-arc build [-o name] [go-build-flags] [package]
+arc build [-o name] [--config arc.json] [go-build-flags] [package]
 ```
 
 The only command you need for a production build. Runs the following steps in order:
@@ -77,13 +77,23 @@ The `main.cpp` is identical on every platform and never needs to be edited.
 **6. Pre-configure the CMake build tree**
 
 Runs `cmake -B arc-project/build` so the project is ready to build or open
-in an IDE immediately.
+in an IDE immediately. On macOS, the `-G Xcode` generator is used so the
+project can be opened directly in Xcode.
+
+**7. Configure StoreKit** *(macOS only)*
+
+If an `arc.json` with a `billing` section is present, generates a
+`<binary>.storekit` configuration file in `arc-project/` and patches the
+`<LaunchAction>` of every `.xcscheme` in the build tree to reference it.
+This step is skipped automatically on non-Apple platforms, and is a no-op
+when no billing configuration is found.
 
 ### Flags
 
 | Flag | Description |
 | :--- | :--- |
 | `-o name` | Name of the final host binary. Defaults to the current directory name. |
+| `--config path` | Path to `arc.json`. Defaults to `arc.json` in the current directory if present. |
 
 Any other flags (e.g. `-race`, `-tags`) are forwarded verbatim to `go build`.
 
@@ -96,6 +106,9 @@ arc build .
 # Custom output binary name
 arc build -o myapp .
 
+# Explicit arc.json location
+arc build -o myapp --config path/to/arc.json .
+
 # With extra go build flags
 arc build -race -o myapp .
 ```
@@ -105,6 +118,7 @@ arc build -race -o myapp .
 ```
 your-app/
 ├── main.go                        ← your app, untouched
+├── arc.json                       ← optional app/billing config
 ├── go.mod
 │
 └── arc-project/
@@ -112,6 +126,7 @@ your-app/
     ├── main.cpp                   ← auto-generated host entry point
     ├── libarc-module.dylib        ← your compiled Go logic
     ├── libarc.dylib               ← native webview + run loop
+    ├── <binary>.storekit          ← generated from arc.json (macOS, if billing config present)
     ├── libarc/
     │   └── include/               ← libarc headers (for compilation)
     └── build/                     ← cmake build tree, configured and ready
@@ -125,6 +140,54 @@ cd arc-project && cmake --build build
 
 Or open `arc-project/build/*.xcodeproj` in Xcode for a full native debug
 session with breakpoints, Instruments, and the memory graph.
+
+---
+
+## `arc.json`
+
+An optional `arc.json` file placed alongside your Go source can configure
+app metadata and in-app billing. It is detected automatically, or supplied
+explicitly via `--config`.
+
+```json
+{
+  "app": {
+    "name": "My App",
+    "bundle_id": "com.example.myapp"
+  },
+  "billing": {
+    "identifier": "a1b2c3d4",
+    "subscription_groups": [
+      {
+        "id": "e5f6a7b8",
+        "name": "Pro",
+        "subscriptions": [
+          {
+            "product_id": "com.example.myapp.pro.monthly",
+            "reference_name": "Pro Monthly",
+            "display_price": "4.99",
+            "recurring_period": "P1M",
+            "family_shareable": false,
+            "group_number": 1,
+            "internal_id": "c9d0e1f2",
+            "localizations": [
+              {
+                "locale": "en_US",
+                "display_name": "Pro Monthly",
+                "description": "Full access, billed monthly."
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The `billing` section maps directly to Apple's `.storekit` configuration
+format. Identifiers must be 8-character hex strings. `recurring_period`
+follows ISO 8601 duration notation (e.g. `P1M` for monthly, `P1Y` for yearly).
 
 ---
 

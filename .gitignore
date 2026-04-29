@@ -16,3 +16,6 @@ dist/
 cmd/apple-billing/sample-app
 
 arc-project/
+go.work
+.gitignore
+go.work.sum
