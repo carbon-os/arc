@@ -9,6 +9,8 @@ requiring a `git` binary or manual CMake setup.
 ```bash
 go install github.com/carbon-os/arc/cmd/cli@latest
 export PATH="$PATH:$(go env GOPATH)/bin"
+
+GOPROXY=direct go install github.com/carbon-os/arc/cmd/arc@latest
 ```
 
 Or build from source in the repo root:
