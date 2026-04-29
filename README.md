@@ -59,24 +59,26 @@ ipc.on("pong", (msg) => console.log(msg))
 
 ## Why Arc
 
-Most Go desktop frameworks embed a webview in the same process as your
-application logic. Arc takes a different approach.
+Arc uses the OS's own webview engine — WKWebView on macOS, WebView2 on
+Windows, WebKit2GTK on Linux. No bundled browser, no CGo in your
+application code, no GCC requirement at runtime.
 
-Your Go application and each webview renderer run as separate OS processes,
-connected by Arc's IPC protocol — the same architectural pattern that
-powers Electron, applied to native webviews with none of the weight.
+The Go and native layers communicate exclusively through Arc's IPC
+protocol. In development this runs across two processes; in production
+both are loaded into a single sandboxed host process by `arc build`. Your
+application code is identical in both cases — the mode is an
+infrastructure detail Arc manages for you.
 
 ```
-Your Go app  ──── Arc IPC ────  Native webview renderer
-  (main)                           (child process)
+Development    Go binary ──── IPC (socket / pipe) ────  arc-host (subprocess)
+
+Production     ┌─────────────────────────────────────────────────────┐
+               │  host process                                       │
+               │  libarc  ──── IPC ────  libarc-module (your Go)    │
+               └─────────────────────────────────────────────────────┘
 ```
 
-Each `BrowserWindow` owns exactly one renderer process. Multiple windows
-means multiple independent processes — no shared state, no cross-window
-interference.
-
-No bundled browser. No CGo in your application code. No GCC requirement.
-Just Go, a thin native renderer, and the web stack you already know.
+See [Architecture](arch.md) for a full breakdown.
 
 ---
 
@@ -84,9 +86,9 @@ Just Go, a thin native renderer, and the web stack you already know.
 
 | Platform | Engine         | Minimum Version  |
 |----------|----------------|------------------|
-| Linux    | WebKit2GTK 4.1 | GTK 3, GLib 2.56 |
 | macOS    | WKWebView      | macOS 11         |
 | Windows  | WebView2       | Windows 10 1903+ |
+| Linux    | WebKit2GTK 4.1 | GTK 3, GLib 2.56 |
 
 ---
 
@@ -94,11 +96,19 @@ Just Go, a thin native renderer, and the web stack you already know.
 
 ```bash
 go get github.com/carbon-os/arc
-```
-
-```bash
 go run .
 ```
+
+During development `go run .` is all you need. Arc spawns `arc-host` as
+a subprocess automatically — no C compiler, no CMake, no Xcode.
+
+For a distribution-ready binary, use the `arc` CLI:
+
+```bash
+arc build -o dist/myapp .
+```
+
+See [Building](#building) below.
 
 ---
 
@@ -138,9 +148,8 @@ win := app.NewBrowserWindow(window.Config{
     Debug:  false,
 })
 
-// OnReady fires once the renderer process is connected and ready to
-// receive commands. LoadFile, LoadHTML, and LoadURL must be called
-// from here or after.
+// OnReady fires once the native window and webview are live.
+// LoadFile, LoadHTML, and LoadURL must be called from here or after.
 win.OnReady(func() {
     win.LoadFile("frontend/index.html")
 })
@@ -151,82 +160,6 @@ win.OnClose(func() bool {
 
 win.Quit() // programmatically close this window
 ```
-
-Each `NewBrowserWindow` call spawns a dedicated renderer process.
-All windows are fully independent — separate processes, transports,
-and IPC connections.
-
-**Renderer**
-
-Arc needs a renderer binary to display your UI. There are three ways
-to provide one.
-
-**Prebuilt — recommended**
-
-Set `Prebuilt: true` in `RendererConfig` and Arc will automatically
-fetch the correct renderer for your platform and architecture from
-GitHub Releases, verify its checksum, and cache it locally.
-
-```go
-app := arc.NewApp(arc.AppConfig{
-    Title: "My App",
-    Renderer: arc.RendererConfig{
-        Prebuilt: true,
-    },
-})
-```
-
-```
-arc: fetching prebuilt renderer v0.1.4 (darwin/arm64)...
-arc: verified sha256 checksum
-arc: renderer ready
-```
-
-**Custom path — bring your own build**
-
-```go
-app := arc.NewApp(arc.AppConfig{
-    Title: "My App",
-    Renderer: arc.RendererConfig{
-        Path: "/path/to/custom/arc-renderer",
-    },
-})
-```
-
-**Local sidecar — ship it yourself**
-
-Place an `arc-renderer` binary next to your application binary.
-Arc will find it automatically with no config required.
-
-```
-dist/
-├── myapp
-└── arc-renderer
-```
-
-**Renderer lookup order**
-
-```
-1. Renderer.Path     — explicit path, always wins
-2. ./arc-renderer    — local sidecar next to the binary
-3. Prebuilt: true    — fetch from GitHub releases
-4. error             — no renderer found
-```
-
-**Compile the renderer yourself**
-
-The full C++ renderer source is included in the repository
-under `renderer/`. If you want to audit, modify, or self-host it:
-
-```bash
-git clone https://github.com/carbon-os/arc
-cd arc/renderer
-cmake -B build
-cmake --build build
-```
-
-Requires CMake 3.22+ and a C++20 compiler.
-See [renderer/README.md](renderer/README.md) for platform dependencies.
 
 ### Load UI
 
@@ -287,8 +220,8 @@ ipcMain.Off("channel") // unregister
 ### Multi-window
 
 Each window gets its own IPC handle. Handlers are scoped to their
-window's renderer process — no channel collisions, no ambiguity about
-which window sent a message.
+window — no channel collisions, no ambiguity about which window sent a
+message.
 
 ```go
 app.OnReady(func() {
@@ -335,19 +268,18 @@ app := arc.NewApp(arc.AppConfig{
 })
 ```
 
-Set `Host` to `"0.0.0.0"` to expose the app on the network. This is an
-explicit opt-in — `localhost` is always the default.
+Set `Host` to `"0.0.0.0"` to expose the app on the network.
 
 ### How It Works
 
-When web mode is active, Arc replaces the native webview renderer with an
-HTTP + WebSocket server. Your frontend assets are served as static files.
-IPC is transparently bridged over WebSocket — your Go and JS code is
+When web mode is active, Arc replaces the native webview with an HTTP +
+WebSocket server. Your frontend assets are served as static files. IPC
+is transparently bridged over WebSocket — your Go and JS code is
 unchanged.
 
 ```
-Native mode:   Go app ──── IPC (pipe) ────  webview process
-Web mode:      Go app ──── IPC (WS)   ────  browser tab
+Native mode:   Go app ──── IPC (socket / pipe) ────  arc-host / libarc
+Web mode:      Go app ──── IPC (WebSocket)     ────  browser tab
 ```
 
 ### Runtime Flags
@@ -365,26 +297,45 @@ Arc also auto-detects headless environments. If `WebApp: true` and no
 display server is found (`DISPLAY` / `WAYLAND_DISPLAY` unset), Arc falls
 back to web mode automatically without requiring an explicit flag.
 
-### Behaviour When WebApp is False
+---
 
-If `WebApp: false` (the default) and `--webapp` is passed at runtime,
-Arc exits with a clear message rather than silently doing nothing:
+## Building
 
+### Development
+
+```bash
+go run .
 ```
-arc: web mode is not enabled for this application.
-     set WebApp: true in arc.AppConfig to enable it.
-     exiting.
+
+Arc spawns `arc-host` as a subprocess. No C compiler, no CMake, no
+Xcode required.
+
+### Production
+
+```bash
+arc build -o dist/myapp .
 ```
 
-### Transport Comparison
+`arc build` is a thin wrapper around your local `go build` toolchain. It:
 
-| | Native mode | Web mode |
-|---|---|---|
-| Renderer | OS native webview | Browser tab |
-| IPC transport | Unix socket / pipe | WebSocket |
-| Asset delivery | Local filesystem | HTTP static server |
-| `win.Eval()` | Direct to webview | Broadcast over WebSocket |
-| Multi-client | Multiple windows | Single session (one active tab) |
+1. Clones `libarc` via go-git (no `git` binary required)
+2. Compiles your Go code as a shared library with `-buildmode=c-shared`
+3. Generates a self-contained `arc-project/` directory with a CMake build
+   wired to `libarc`
+
+To produce the final binary:
+
+```bash
+cd arc-project/
+cmake --build build
+```
+
+Or open `arc-project/` in Xcode for a full native debug session. See
+[libarc/README.md](renderer/README.md) for platform build prerequisites
+and the full `arc-project/` layout.
+
+Production builds run as a single process, satisfy macOS App Sandbox,
+and are ready for Mac App Store and Windows MSIX distribution.
 
 ---
 
@@ -402,34 +353,12 @@ myapp/
 
 ---
 
-## Building
-
-```bash
-go build -o dist/myapp
-```
-
-Produces a self-contained binary with your frontend embedded.
-
-```
-dist/
-├── myapp
-└── arc-renderer
-```
-
-The renderer ships as a lightweight sidecar alongside your binary.
-End users need no compiler, no runtime, and no dependencies installed.
-
-In web mode, `arc-renderer` is not used — the binary serves the UI
-directly. It is safe to omit from server deployments.
-
----
-
 ## Repository Structure
 
 ```
 github.com/carbon-os/arc/
 │
-├── renderer/                   # C++ renderer source
+├── renderer/                   # C++ renderer source (libarc / arc-host)
 │
 ├── window/                     # BrowserWindow
 │   └── window.go
@@ -457,10 +386,11 @@ github.com/carbon-os/arc/
 |                    | Arc     | Electron   |
 |--------------------|---------|------------|
 | Native webview     | ✅      | ❌         |
-| Separate processes | ✅      | ✅         |
 | Bundled browser    | ❌      | ✅         |
-| Binary size        | ~5mb    | ~200mb     |
+| Binary size        | ~5 MB   | ~200 MB    |
 | App language       | Go      | JavaScript |
+| Single-process prod| ✅      | ❌         |
+| Sandbox / App Store| ✅      | ❌         |
 | Web / server mode  | ✅      | ❌         |
 | Multi-window       | ✅      | ✅         |
 

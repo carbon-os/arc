@@ -34,7 +34,7 @@ The Go application runs as a standalone binary and is the controller.
 This mode requires only the Go toolchain and a prebuilt `arc-host` binary
 for your platform. No C compiler, no CMake, no Xcode.
 
-```
+```bash
 go run .
 ```
 
@@ -91,6 +91,103 @@ tears down cleanly.
 **Sandbox compatibility:** Both libraries are loaded in-process. No
 subprocess spawning occurs. This satisfies macOS App Sandbox, Mac App
 Store, and Windows AppX / MSIX packaging requirements.
+
+---
+
+## The `arc` CLI
+
+The `arc` binary is a thin build tool that sits in front of your existing
+Go toolchain. It does not replace `go build` — it calls it. All standard
+Go flags and arguments are proxied through unchanged.
+
+### `arc build`
+
+```bash
+cd your-app/
+arc build -o your-binary-name .
+```
+
+Running `arc build` performs the following steps in order:
+
+**1. Clone libarc**
+
+Uses [go-git v5](https://github.com/go-git/go-git) — a pure Go git
+implementation bundled into the `arc` binary — to clone or update
+`https://github.com/carbon-os/arc` into `arc-project/libarc/`. No `git`
+binary is required on the host machine.
+
+```
+downloading libarc from github.com/carbon-os/arc
+creating arc-project/
+```
+
+**2. Compile your Go module**
+
+Injects a temporary `_arc_entry.go` into your package (the `AppMain`
+stub), then proxies to the local `go build` toolchain with
+`-buildmode=c-shared`:
+
+```bash
+go build -buildmode=c-shared -o arc-project/libarc-module.dylib .
+```
+
+The stub is removed on completion. Your source files are never modified.
+
+**3. Generate `arc-project/`**
+
+Writes a self-contained `arc-project/` directory alongside your Go code
+with a generated `CMakeLists.txt` and `main.cpp`, the compiled Go module,
+and the libarc shared library. The CMake build tree is pre-configured but
+not yet compiled — you decide when to build the final binary.
+
+```
+your-app/
+├── main.go                        ← your app, untouched
+├── go.mod
+│
+└── arc-project/
+    ├── CMakeLists.txt             ← auto-generated, wired to libarc + your module
+    ├── main.cpp                   ← auto-generated host entry point
+    ├── libarc-module.dylib        ← your compiled Go logic
+    ├── libarc.dylib               ← native webview + run loop
+    └── build/                     ← cmake build dir, configured and ready
+```
+
+To produce the final host binary:
+
+```bash
+cd arc-project/
+cmake --build build
+```
+
+Or open `arc-project/` in Xcode for a full native debug session with
+breakpoints, Instruments, and the memory graph.
+
+### The generated `main.cpp`
+
+`arc build` stamps out a `main.cpp` that is identical on every platform
+and never changes:
+
+```cpp
+#include <arc/arc.h>
+
+int main() {
+    arc::LoadModule("@executable_path/libarc-module.dylib");
+    arc::Run();
+    return 0;
+}
+```
+
+Platform-correct paths per target:
+
+```cpp
+arc::LoadModule("@executable_path/libarc-module.dylib"); // macOS
+arc::LoadModule("libarc-module.so");                      // Linux
+arc::LoadModule("libarc-module.dll");                     // Windows
+```
+
+You never write or edit this file. `arc build` regenerates it on every
+run.
 
 ---
 
@@ -186,19 +283,13 @@ int main() {
 `arc build` generates the correct platform path:
 
 ```cpp
-arc::LoadModule("@executable_path/libarc-module.dylib");  // macOS
-arc::LoadModule("libarc-module.so");                       // Linux
-arc::LoadModule("libarc-module.dll");                      // Windows
+arc::LoadModule("@executable_path/libarc-module.dylib"); // macOS
+arc::LoadModule("libarc-module.so");                      // Linux
+arc::LoadModule("libarc-module.dll");                     // Windows
 ```
 
 For local testing during development you can point `LoadModule` at any
-path:
-
-```cpp
-arc::LoadModule("/path/to/libarc-module.dylib");
-```
-
-Or use `arc-host` directly without generating a host binary at all:
+path, or skip the host binary entirely and run `arc-host` directly:
 
 ```bash
 # build your Go module
@@ -301,36 +392,6 @@ The source code is the same in both cases.
 
 ---
 
-## arc build
-
-`arc build` produces a self-contained, distribution-ready app bundle.
-
-```
-arc build
-  │
-  ├── writes _arc_entry.go              (AppMain stub)
-  ├── go build -buildmode=c-shared -o libarc-module.dylib .
-  ├── fetches or builds libarc for target platform
-  ├── generates main.cpp
-  ├── compiles host binary
-  ├── assembles app bundle
-  ├── applies entitlements and codesigning
-  └── removes _arc_entry.go
-```
-
-Output on macOS:
-
-```
-MyApp.app/
-└── Contents/
-    └── MacOS/
-        ├── MyApp               ← generated host binary
-        ├── libarc.dylib        ← native webview + run loop
-        └── libarc-module.dylib ← your Go logic
-```
-
----
-
 ## Mode Comparison
 
 |                          | Development          | Production              |
@@ -354,6 +415,12 @@ MyApp.app/
 **Go is the controller in development.** In production, `libarc` takes
 over as controller and Go becomes the module it loads. The developer
 sees neither transition.
+
+**`arc build` is a proxy, not a build system.** It calls your local `go
+build` toolchain with the right flags, clones libarc via go-git so no
+`git` binary is needed, and generates an `arc-project/` directory you
+can build with CMake or open in Xcode. It adds no new concepts on top of
+the tools you already know.
 
 **IPC is the boundary.** Go and `libarc` communicate only through the
 IPC protocol in both modes. The Go runtime stays off the native UI
