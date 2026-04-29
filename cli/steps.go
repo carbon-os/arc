@@ -156,18 +156,14 @@ func stepGenerateProject(cfg *buildConfig) error {
 		ModuleName:     filepath.Base(cfg.moduleLib),
 		LoadModulePath: loadModulePath(filepath.Base(cfg.moduleLib)),
 		LibArcInclude:  "libarc/include",
-		MainFile:       "main.cpp",
 	}
 
-	// On macOS, use main.mm and inject the bundle ID so StoreKit has an
-	// identifier before it tries to talk to the store daemon.
-	mainTmpl := MainCppTmpl
+	// On macOS, pull app name and bundle ID from arc.json so CMake can
+	// produce a proper .app bundle with Info.plist — required for StoreKit.
 	if runtime.GOOS == "darwin" && cfg.arcJSON != "" {
-		if arcCfg, err := LoadArcConfig(cfg.arcJSON); err == nil &&
-			arcCfg.App != nil && arcCfg.App.BundleID != "" {
+		if arcCfg, err := LoadArcConfig(cfg.arcJSON); err == nil && arcCfg.App != nil {
 			data.BundleID = arcCfg.App.BundleID
-			data.MainFile = "main.mm"
-			mainTmpl = MainMmTmpl
+			data.AppName = arcCfg.App.Name
 		}
 	}
 
@@ -176,7 +172,7 @@ func stepGenerateProject(cfg *buildConfig) error {
 		tmpl string
 	}{
 		{"CMakeLists.txt", CMakeListsTmpl},
-		{data.MainFile, mainTmpl},
+		{"main.cpp", MainCppTmpl},
 	}
 
 	for _, f := range files {
