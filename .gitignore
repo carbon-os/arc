@@ -13,5 +13,6 @@ cmd/app
 
 dist/
 
-cmd/dev
 cmd/apple-billing/sample-app
+
+arc-project/

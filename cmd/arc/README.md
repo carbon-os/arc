@@ -7,7 +7,7 @@ requiring a `git` binary or manual CMake setup.
 ## Installation
 
 ```bash
-go install github.com/carbon-os/arc/cmd/cli@main
+go install github.com/carbon-os/arc/cmd/cli@latest
 export PATH="$PATH:$(go env GOPATH)/bin"
 ```
 
