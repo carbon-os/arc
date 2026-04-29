@@ -35,7 +35,6 @@ void LoadModule(const char* path)
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-// AppMain signature exported by the Go module.
 using AppMainFn = int(*)(const char*);
 
 static AppMainFn resolve_app_main(const std::string& path)
@@ -66,7 +65,9 @@ static AppMainFn resolve_app_main(const std::string& path)
 #endif
 }
 
-static std::string gen_socket_path()
+// Generate a bare random ID — no path prefix, no extension.
+// This is what gets passed to AppMain and to Go's channelPath(id).
+static std::string gen_id()
 {
     std::random_device                      rd;
     std::mt19937                            gen(rd());
@@ -74,9 +75,15 @@ static std::string gen_socket_path()
 
     char id[17];
     std::snprintf(id, sizeof(id), "%08x%08x", dist(gen), dist(gen));
+    return std::string(id);
+}
 
+// Build the full socket/pipe path from a bare ID — mirrors channelPath in
+// transport_unix.go and transport_windows.go exactly.
+static std::string id_to_path(const std::string& id)
+{
 #ifdef _WIN32
-    return std::string("\\\\.\\pipe\\arc-") + id;
+    return "\\\\.\\pipe\\arc-" + id;
 #else
     const char* tmp = std::getenv("TMPDIR");
     if (!tmp || !*tmp) tmp = "/tmp";
@@ -109,39 +116,37 @@ void Run()
     if (s_module_path.empty())
         throw std::runtime_error("arc::Run: call LoadModule before Run");
 
-    const std::string sock_path = gen_socket_path();
-    logger::Info("arc::Run: socket path %s", sock_path.c_str());
+    // Generate a bare ID. Go receives this and wraps it into a full path
+    // via channelPath(id). We do the same here via id_to_path(id).
+    const std::string id        = gen_id();
+    const std::string sock_path = id_to_path(id);
+
+    logger::Info("arc::Run: channel id=%s path=%s", id.c_str(), sock_path.c_str());
 
     AppMainFn app_main = resolve_app_main(s_module_path);
     logger::Info("arc::Run: loaded module %s", s_module_path.c_str());
 
-    // Dispatch AppMain on a background thread. It receives the socket path,
-    // starts the Go runtime, listens on the socket, and blocks for the
-    // lifetime of the application.
-    //
-    // On Apple we use GCD so the thread has a proper run-loop context.
-    // On all other platforms a detached std::thread is sufficient.
-
-    auto* path_copy = new std::string(sock_path);
+    // Pass the bare ID to AppMain — Go's channelPath() will reconstruct
+    // the full socket path from it.
+    auto* id_copy = new std::string(id);
 
 #ifdef __APPLE__
     dispatch_async(
         dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            app_main(path_copy->c_str());
-            delete path_copy;
+            app_main(id_copy->c_str());
+            delete id_copy;
         });
 #else
-    std::thread([app_main, path_copy]() {
-        app_main(path_copy->c_str());
-        delete path_copy;
+    std::thread([app_main, id_copy]() {
+        app_main(id_copy->c_str());
+        delete id_copy;
     }).detach();
 #endif
 
-    // Give Go a moment to open its listener, then connect.
+    // Connect using the full path we built from the same ID.
     auto channel = connect_with_retry(sock_path);
     logger::Info("arc::Run: connected to module");
 
-    // Hand off to the shared run loop — blocks until the window is closed.
     detail::run_with_channel(*channel);
 }
 
