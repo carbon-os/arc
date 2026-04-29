@@ -1,38 +1,33 @@
 {
-  "appName": "Sample App",
-  "package": {
-    "outDir": "dist",
-    "binaryPath": "./sample-app",
-    "rendererBuildDir": "../../renderer/build/bin",
-    "macos": {
-      "bundleID": "com.sample.app",
-      "version": "1.0.0",
-      "build": "1",
-      "minMacOS": "13.0",
-      "teamID": "ABCDE12345",
-      "signCert": "Apple Development: Your Name",
-      "iap": {
-        "configIdentifier": "00000000",
-        "subscriptionGroups": [
+  "app": {
+    "name": "Carbon AI",
+    "bundle_id": "com.carbon-os.carbonai"
+  },
+  "billing": {
+    "identifier": "4B8E2A1C",
+    "subscription_groups": [
+      {
+        "id": "7F3D9E2B",
+        "name": "Carbon AI Plus",
+        "subscriptions": [
           {
-            "id": "SUBGROUP1",
-            "name": "Plus Subscriptions",
-            "subscriptions": [
+            "product_id": "carbon.ai.plus.0002",
+            "reference_name": "Carbon AI Plus Monthly",
+            "display_price": "9.99",
+            "recurring_period": "P1M",
+            "family_shareable": false,
+            "group_number": 1,
+            "internal_id": "D1A2B3C4",
+            "localizations": [
               {
-                "internalID": "00000001",
-                "productID": "com.sample.app.plus.0001",
-                "referenceName": "Plus Monthly",
-                "displayName": "Sample App Plus",
-                "description": "Unlock all premium features.",
-                "displayPrice": "9.99",
-                "period": "P1M",
-                "familyShareable": false,
-                "groupNumber": 1
+                "locale": "en_US",
+                "display_name": "Carbon AI Plus",
+                "description": "Unlock all Carbon AI premium features."
               }
             ]
           }
         ]
       }
-    }
+    ]
   }
 }

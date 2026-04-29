@@ -46,28 +46,35 @@ The only command you need for a production build. Runs the following steps in or
 
 Uses [go-git v5](https://github.com/go-git/go-git) — a pure Go git
 implementation bundled into the `arc` binary — to clone or update
-`https://github.com/carbon-os/arc` into `arc-project/libarc/`. No `git`
+`https://github.com/carbon-os/arc` into `arc-project/arc-repo/`. No `git`
 binary is required on the host machine.
 
 **2. Build libarc with CMake**
 
-Configures and builds libarc in Release mode inside `arc-project/libarc/build/`,
-then copies the resulting shared library into `arc-project/`. On Windows,
-`VCPKG_ROOT` must be set.
+Configures and builds libarc in Release mode inside `arc-project/arc-repo/libarc/build/`,
+then copies the resulting shared library and `libarc/include/` headers into
+`arc-project/`. The cloned repo is removed once the copy is complete. On
+Windows, `VCPKG_ROOT` must be set.
 
-**3. Compile your Go module**
+**3. Resolve Go dependencies**
 
-Injects a temporary `_arc_entry.go` stub into your package, then calls
-`go build -buildmode=c-shared` to produce `arc-project/libarc-module.{ext}`.
-The stub exports `AppMain` — the symbol libarc calls in production mode. It
-is always removed after the build, even on failure.
+Runs `go mod init` (if no `go.mod` exists yet) followed by `go mod tidy` to
+ensure all dependencies are present before compilation.
 
-**4. Generate `arc-project/`**
+**4. Compile your Go module**
+
+Injects a temporary `arc_entry_generated.go` stub into your package, then
+calls `go build -buildmode=c-shared` to produce
+`arc-project/libarc-module.{ext}`. The stub exports `AppMain` — the symbol
+libarc calls in production mode. It is always removed after the build, even
+on failure.
+
+**5. Generate `arc-project/`**
 
 Writes a `CMakeLists.txt` and `main.cpp` alongside the compiled libraries.
 The `main.cpp` is identical on every platform and never needs to be edited.
 
-**5. Pre-configure the CMake build tree**
+**6. Pre-configure the CMake build tree**
 
 Runs `cmake -B arc-project/build` so the project is ready to build or open
 in an IDE immediately.
@@ -105,7 +112,8 @@ your-app/
     ├── main.cpp                   ← auto-generated host entry point
     ├── libarc-module.dylib        ← your compiled Go logic
     ├── libarc.dylib               ← native webview + run loop
-    ├── libarc/                    ← full libarc source (for Xcode / debugging)
+    ├── libarc/
+    │   └── include/               ← libarc headers (for compilation)
     └── build/                     ← cmake build tree, configured and ready
 ```
 
@@ -115,8 +123,8 @@ To produce the final host binary:
 cd arc-project && cmake --build build
 ```
 
-Or open `arc-project/` directly in Xcode for a full native debug session with
-breakpoints, Instruments, and the memory graph.
+Or open `arc-project/build/*.xcodeproj` in Xcode for a full native debug
+session with breakpoints, Instruments, and the memory graph.
 
 ---
 
