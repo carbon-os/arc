@@ -75,7 +75,7 @@ Examples:
 
 After running arc build:
   cd arc-project && cmake --build build
-  — or open arc-project/ in Xcode for a native debug session
+  — or open arc-project/build/*.xcodeproj in Xcode for a native debug session
 `)
 }
 
@@ -86,13 +86,14 @@ type buildConfig struct {
 	goFlags    []string // extra flags forwarded verbatim to go build
 	goPackage  string   // package argument, defaults to "."
 
-	wd         string // working directory at invocation time
-	projectDir string // <wd>/arc-project/
-	arcRepoDir string // <wd>/arc-project/arc-repo/         (full cloned repo)
-	libarcDir  string // <wd>/arc-project/arc-repo/libarc/  (C++ source)
-	moduleLib  string // <wd>/arc-project/libarc-module.{ext}
-	libarcLib  string // <wd>/arc-project/{libarc.dylib|libarc.so|arc.dll}
-	stubPath   string // <wd>/_arc_entry.go
+	wd             string // working directory at invocation time
+	projectDir     string // <wd>/arc-project/
+	arcRepoDir     string // <wd>/arc-project/arc-repo/         (full cloned repo)
+	libarcDir      string // <wd>/arc-project/arc-repo/libarc/  (C++ source)
+	libarcDestDir  string // <wd>/arc-project/libarc/           (copied out of repo)
+	moduleLib      string // <wd>/arc-project/libarc-module.{ext}
+	libarcLib      string // <wd>/arc-project/{libarc.dylib|libarc.so|arc.dll}
+	stubPath       string // <wd>/_arc_entry.go
 }
 
 func parseBuildArgs(args []string) (*buildConfig, error) {
@@ -122,12 +123,13 @@ func parseBuildArgs(args []string) (*buildConfig, error) {
 		cfg.binaryName = filepath.Base(wd)
 	}
 
-	cfg.projectDir = filepath.Join(wd, "arc-project")
-	cfg.arcRepoDir = filepath.Join(cfg.projectDir, "arc-repo")
-	cfg.libarcDir  = filepath.Join(cfg.arcRepoDir, "libarc")
-	cfg.moduleLib  = filepath.Join(cfg.projectDir, "libarc-module"+sharedExt())
-	cfg.libarcLib  = filepath.Join(cfg.projectDir, libarcFileName())
-	cfg.stubPath   = filepath.Join(wd, "_arc_entry.go")
+	cfg.projectDir    = filepath.Join(wd, "arc-project")
+	cfg.arcRepoDir    = filepath.Join(cfg.projectDir, "arc-repo")
+	cfg.libarcDir     = filepath.Join(cfg.arcRepoDir, "libarc")
+	cfg.libarcDestDir = filepath.Join(cfg.projectDir, "libarc")
+	cfg.moduleLib     = filepath.Join(cfg.projectDir, "libarc-module"+sharedExt())
+	cfg.libarcLib     = filepath.Join(cfg.projectDir, libarcFileName())
+	cfg.stubPath      = filepath.Join(wd, "_arc_entry.go")
 
 	return cfg, nil
 }
@@ -163,7 +165,7 @@ func runBuild(args []string) error {
 	fmt.Printf("   To build the final binary:\n")
 	fmt.Printf("     cd arc-project && cmake --build build\n\n")
 	fmt.Printf("   To debug natively:\n")
-	fmt.Printf("     open arc-project/ in Xcode\n\n")
+	fmt.Printf("     open arc-project/build/*.xcodeproj\n\n")
 	return nil
 }
 
@@ -199,7 +201,7 @@ func stepCloneLibarc(cfg *buildConfig) error {
 	return err
 }
 
-// ── step 2: build libarc with cmake ──────────────────────────────────────────
+// ── step 2: build libarc, copy out headers + dylib, delete repo ──────────────
 
 func stepBuildLibarc(cfg *buildConfig) error {
 	buildDir := filepath.Join(cfg.libarcDir, "build")
@@ -231,8 +233,24 @@ func stepBuildLibarc(cfg *buildConfig) error {
 	if err != nil {
 		return err
 	}
+
+	// Copy the built library to arc-project/
 	fmt.Printf("   copying %s → arc-project/%s\n", filepath.Base(built), filepath.Base(cfg.libarcLib))
-	return copyFile(built, cfg.libarcLib)
+	if err := copyFile(built, cfg.libarcLib); err != nil {
+		return err
+	}
+
+	// Copy libarc/include → arc-project/libarc/include
+	srcInclude := filepath.Join(cfg.libarcDir, "include")
+	dstInclude := filepath.Join(cfg.libarcDestDir, "include")
+	fmt.Printf("   copying libarc/include → arc-project/libarc/include\n")
+	if err := copyDir(srcInclude, dstInclude); err != nil {
+		return fmt.Errorf("copy include: %w", err)
+	}
+
+	// Delete the repo — no longer needed
+	fmt.Printf("   removing arc-repo (no longer needed)\n")
+	return os.RemoveAll(cfg.arcRepoDir)
 }
 
 func findBuiltLibarc(buildDir string) (string, error) {
@@ -257,7 +275,6 @@ func findBuiltLibarc(buildDir string) (string, error) {
 func stepGoMod(cfg *buildConfig) error {
 	goMod := filepath.Join(cfg.wd, "go.mod")
 	if _, err := os.Stat(goMod); os.IsNotExist(err) {
-		// Derive a simple module path from the binary name.
 		modulePath := "app/" + cfg.binaryName
 		fmt.Printf("   go mod init %s\n", modulePath)
 		if err := runCmd(cfg.wd, "go", "mod", "init", modulePath); err != nil {
@@ -362,7 +379,7 @@ func stepGenerateProject(cfg *buildConfig) error {
 		LibArcName:     filepath.Base(cfg.libarcLib),
 		ModuleName:     filepath.Base(cfg.moduleLib),
 		LoadModulePath: loadModulePath(filepath.Base(cfg.moduleLib)),
-		LibArcInclude:  filepath.ToSlash(filepath.Join("arc-repo", "libarc", "include")),
+		LibArcInclude:  "libarc/include",
 	}
 
 	files := []struct {
@@ -411,6 +428,9 @@ func stepConfigureCmake(cfg *buildConfig) error {
 	}
 
 	configureArgs := []string{cfg.projectDir, "-B", buildDir, "-DCMAKE_BUILD_TYPE=Release"}
+	if runtime.GOOS == "darwin" {
+		configureArgs = append(configureArgs, "-G", "Xcode")
+	}
 	if runtime.GOOS == "windows" {
 		if vcpkg := os.Getenv("VCPKG_ROOT"); vcpkg != "" {
 			configureArgs = append(configureArgs,
@@ -471,4 +491,22 @@ func copyFile(src, dst string) error {
 	defer out.Close()
 	_, err = io.Copy(out, in)
 	return err
+}
+
+// copyDir recursively copies src into dst, creating directories as needed.
+func copyDir(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+		return copyFile(path, target)
+	})
 }
