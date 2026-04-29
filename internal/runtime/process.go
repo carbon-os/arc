@@ -22,6 +22,11 @@ type Config struct {
 	Prebuilt     bool
 	OnReady      func()
 	OnClose      func() bool
+
+	// ChannelID, when non-empty, disables renderer spawning. Arc will connect
+	// to an already-running renderer on this channel instead of starting one.
+	// Populated automatically from --channel when main_process.mm is the parent.
+	ChannelID string
 }
 
 // MessageHandler is the internal callback type used by the ipc package.
@@ -74,56 +79,80 @@ func New(cfg Config) (*Runtime, error) {
 	}, nil
 }
 
-// Run resolves the renderer binary, spawns the renderer process, and blocks
-// on the event loop until the window is closed or Quit is called.
+// Run connects to or spawns the renderer process, then blocks on the event
+// loop until the window is closed or Quit is called.
+//
+// When cfg.ChannelID is set (external renderer mode), Run connects to an
+// already-listening socket opened by main_process.mm — no subprocess is
+// started. When cfg.ChannelID is empty (self-spawn mode), Run resolves the
+// renderer binary, listens on a new socket, and spawns the renderer itself.
 func (rt *Runtime) Run() error {
 	wv2Path, err := EnsureWebView2()
 	if err != nil {
 		return fmt.Errorf("arc: webview2: %w", err)
 	}
 
-	rendererPath, err := EnsureRenderer(rt.cfg.RendererPath, rt.cfg.Prebuilt)
-	if err != nil {
-		return err
+	var transport *Transport
+
+	if rt.cfg.ChannelID != "" {
+		rt.log.Printf("[go] Run: external renderer mode, listening on channel %s", rt.cfg.ChannelID)
+
+		t, err := ListenTransport(rt.cfg.ChannelID)
+		if err != nil {
+			return fmt.Errorf("arc: listen for renderer: %w", err)
+		}
+		transport = t
+
+		rt.log.Println("[go] Run: waiting for renderer to connect...")
+		if err := transport.Accept(); err != nil {
+			return fmt.Errorf("arc: renderer did not connect: %w", err)
+		}
+
+	} else {
+		// ── Self-spawn mode (default) ─────────────────────────────────────────
+		// Go is the parent. Resolve the binary, open the socket, spawn renderer.
+		rendererPath, err := EnsureRenderer(rt.cfg.RendererPath, rt.cfg.Prebuilt)
+		if err != nil {
+			return err
+		}
+
+		id := uniqueID()
+		t, err := ListenTransport(id)
+		if err != nil {
+			return err
+		}
+		transport = t
+
+		args := []string{"--channel", transport.ID}
+		if rt.cfg.Logging {
+			args = append(args, "--logging")
+		}
+
+		rt.cmd = exec.Command(rendererPath, args...)
+		rt.cmd.Stderr = prefixWriter("renderer: ")
+
+		if wv2Path != "" {
+			rt.cmd.Env = append(os.Environ(),
+				"WEBVIEW2_BROWSER_EXECUTABLE_FOLDER="+wv2Path,
+			)
+		}
+
+		rt.log.Printf("[go] Run: spawning renderer %s %v", rendererPath, args)
+		if err := rt.cmd.Start(); err != nil {
+			return fmt.Errorf("arc: start renderer: %w", err)
+		}
+
+		rt.log.Println("[go] Run: waiting for renderer to connect...")
+		if err := transport.Accept(); err != nil {
+			return fmt.Errorf("arc: renderer did not connect: %w", err)
+		}
 	}
 
-	id := uniqueID()
-	transport, err := ListenTransport(id)
-	if err != nil {
-		return err
-	}
 	rt.transport = transport
 	defer rt.transport.Close()
-
-	args := []string{"--channel", transport.ID}
-	if rt.cfg.Logging {
-		args = append(args, "--logging")
-	}
-
-	rt.cmd = exec.Command(rendererPath, args...)
-	rt.cmd.Stderr = prefixWriter("renderer: ")
-
-	if wv2Path != "" {
-		rt.cmd.Env = append(os.Environ(),
-			"WEBVIEW2_BROWSER_EXECUTABLE_FOLDER="+wv2Path,
-		)
-	}
-
-	rt.log.Printf("[go] Run: spawning renderer %s %v", rendererPath, args)
-
-	if err := rt.cmd.Start(); err != nil {
-		return fmt.Errorf("arc: start renderer: %w", err)
-	}
-
-	rt.log.Println("[go] Run: waiting for renderer to connect...")
-
-	if err := transport.Accept(); err != nil {
-		return fmt.Errorf("arc: renderer did not connect: %w", err)
-	}
 	rt.conn = transport.Conn()
 
-	rt.log.Println("[go] Run: renderer connected, sending WindowCreate")
-
+	rt.log.Println("[go] Run: sending WindowCreate")
 	if err := rt.sendWindowCreate(); err != nil {
 		return fmt.Errorf("arc: WindowCreate: %w", err)
 	}
@@ -256,7 +285,6 @@ func (rt *Runtime) OffMessage(channel string) {
 }
 
 // OnBillingProducts registers the handler for evtBillingProducts.
-// Called by the billing package — do not call directly.
 func (rt *Runtime) OnBillingProducts(h BillingProductsHandler) {
 	rt.billingMu.Lock()
 	rt.billingProductsHandler = h
@@ -265,7 +293,6 @@ func (rt *Runtime) OnBillingProducts(h BillingProductsHandler) {
 }
 
 // OnBillingPurchase registers the handler for evtBillingPurchase.
-// Called by the billing package — do not call directly.
 func (rt *Runtime) OnBillingPurchase(h BillingPurchaseHandler) {
 	rt.billingMu.Lock()
 	rt.billingPurchaseHandler = h

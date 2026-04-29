@@ -15,3 +15,7 @@ func channelPath(id string) string {
 func listenPlatform(path string) (net.Listener, error) {
 	return net.Listen("unix", path)
 }
+
+func dialPlatform(path string) (net.Conn, error) {
+	return net.Dial("unix", path)
+}

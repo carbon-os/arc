@@ -2,6 +2,7 @@ package arc
 
 import (
 	"log"
+	"os"
 	"sync"
 
 	"github.com/carbon-os/arc/window"
@@ -25,6 +26,11 @@ type AppConfig struct {
 	Port     int
 	Logging  bool
 	Renderer RendererConfig
+
+	// ChannelID can be set explicitly if the caller wants to override which
+	// renderer channel to connect to. Normally left empty — NewApp detects
+	// the --channel flag from os.Args automatically.
+	ChannelID string
 }
 
 // App is the top-level handle for an Arc application.
@@ -38,7 +44,9 @@ type App struct {
 }
 
 // NewApp creates a new App with the given configuration.
-// It does not start any renderers — call Run to do that.
+// If --channel <id> is present in os.Args (set by main_process.mm when it
+// spawns this process), the channel ID is captured automatically and renderer
+// spawning is disabled for all windows.
 func NewApp(cfg AppConfig) *App {
 	if cfg.Host == "" {
 		cfg.Host = "localhost"
@@ -46,7 +54,21 @@ func NewApp(cfg AppConfig) *App {
 	if cfg.Port == 0 {
 		cfg.Port = 8080
 	}
+	if cfg.ChannelID == "" {
+		cfg.ChannelID = parseChannelFlag(os.Args)
+	}
 	return &App{cfg: cfg}
+}
+
+// parseChannelFlag scans argv for --channel <id> and returns the value,
+// or an empty string if the flag is absent.
+func parseChannelFlag(args []string) string {
+	for i := 1; i < len(args)-1; i++ {
+		if args[i] == "--channel" {
+			return args[i+1]
+		}
+	}
+	return ""
 }
 
 // OnReady registers a callback that fires once Run is called and the app
@@ -65,15 +87,17 @@ func (a *App) OnClose(fn func() bool) {
 	a.onClose = fn
 }
 
-// NewBrowserWindow creates a new BrowserWindow and spawns its own dedicated
-// renderer process. Each window is fully independent — its own process,
-// transport, and IPC connection. Safe to call multiple times for multi-window
-// apps. Must be called from within the OnReady callback.
+// NewBrowserWindow creates a new BrowserWindow. In self-spawn mode (the
+// default) it spawns a dedicated renderer subprocess. In external renderer
+// mode (--channel detected) it connects to the pre-spawned renderer instead.
+// Safe to call multiple times for multi-window apps. Must be called from
+// within the OnReady callback.
 func (a *App) NewBrowserWindow(cfg window.Config) *window.BrowserWindow {
 	win := window.New(cfg, window.RendererConfig{
-		Path:     a.cfg.Renderer.Path,
-		Prebuilt: a.cfg.Renderer.Prebuilt,
-		Logging:  a.cfg.Logging,
+		Path:      a.cfg.Renderer.Path,
+		Prebuilt:  a.cfg.Renderer.Prebuilt,
+		Logging:   a.cfg.Logging,
+		ChannelID: a.cfg.ChannelID,
 	})
 
 	a.wg.Add(1)
@@ -104,13 +128,10 @@ func (a *App) Run() error {
 	readyCb := a.onReady
 	a.mu.Unlock()
 
-	// Call synchronously so all NewBrowserWindow calls complete
-	// and wg.Add(1) is registered before wg.Wait() below.
 	if readyCb != nil {
 		readyCb()
 	}
 
-	// Block until every spawned window has exited.
 	a.wg.Wait()
 	return nil
 }

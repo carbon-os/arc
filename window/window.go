@@ -8,12 +8,12 @@ import (
 	"github.com/carbon-os/arc/internal/runtime"
 )
 
-// RendererConfig is forwarded from AppConfig to each window's renderer process.
-// Logging is carried here from AppConfig.Logging — not set directly by callers.
+// RendererConfig is forwarded from AppConfig to each window's runtime.
 type RendererConfig struct {
-	Path     string
-	Prebuilt bool
-	Logging  bool
+	Path      string
+	Prebuilt  bool
+	Logging   bool
+	ChannelID string // non-empty disables renderer spawning
 }
 
 // Config holds the options for a new BrowserWindow.
@@ -25,7 +25,8 @@ type Config struct {
 }
 
 // BrowserWindow is a handle to a native window and its dedicated renderer
-// process. Each BrowserWindow spawns and owns exactly one renderer process.
+// process. Each BrowserWindow spawns and owns exactly one renderer process,
+// or connects to one pre-spawned by an external parent (e.g. main_process.mm).
 type BrowserWindow struct {
 	cfg     Config
 	rt      *runtime.Runtime
@@ -43,8 +44,8 @@ type BrowserWindow struct {
 }
 
 // New creates a BrowserWindow and prepares its runtime. The renderer process
-// is not spawned until Run is called — which App.NewBrowserWindow does
-// automatically in a goroutine.
+// is not spawned (or connected to) until Run is called — which App.NewBrowserWindow
+// does automatically in a goroutine.
 func New(cfg Config, rendererCfg RendererConfig) *BrowserWindow {
 	if cfg.Width == 0 {
 		cfg.Width = 1280
@@ -63,6 +64,7 @@ func New(cfg Config, rendererCfg RendererConfig) *BrowserWindow {
 		RendererPath: rendererCfg.Path,
 		Prebuilt:     rendererCfg.Prebuilt,
 		Logging:      rendererCfg.Logging,
+		ChannelID:    rendererCfg.ChannelID,
 		OnReady: func() {
 			w.mu.Lock()
 			cb := w.onReady
@@ -86,14 +88,13 @@ func New(cfg Config, rendererCfg RendererConfig) *BrowserWindow {
 	return w
 }
 
-// Run spawns the renderer process and blocks until the window is closed.
+// Run connects to or spawns the renderer and blocks until the window is closed.
 // Called automatically by App.NewBrowserWindow — do not call directly.
 func (w *BrowserWindow) Run() error {
 	return w.rt.Run()
 }
 
-// IPC returns the IPC handle for this window. Lazily initialised on first
-// call; the same instance is returned on every subsequent call.
+// IPC returns the IPC handle for this window. Lazily initialised on first call.
 func (w *BrowserWindow) IPC() *ipc.IPC {
 	w.ipcOnce.Do(func() {
 		w.ipcObj = ipc.New(w.rt, w.logging)
@@ -101,10 +102,9 @@ func (w *BrowserWindow) IPC() *ipc.IPC {
 	return w.ipcObj
 }
 
-// NewBilling creates and initialises the Billing handle for this window,
-// sending CmdBillingInit to the renderer subprocess to register products
-// with the platform's native store. Must be called from within OnReady.
-// Subsequent calls return the existing handle unchanged.
+// NewBilling creates and initialises the Billing handle for this window.
+// Must be called from within OnReady. Subsequent calls return the existing
+// handle unchanged.
 func (w *BrowserWindow) NewBilling(cfg billing.Config) (*billing.Billing, error) {
 	w.billingMu.Lock()
 	defer w.billingMu.Unlock()

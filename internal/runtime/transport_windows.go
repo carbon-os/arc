@@ -18,3 +18,7 @@ func listenPlatform(path string) (net.Listener, error) {
 		OutputBufferSize: 65536,
 	})
 }
+
+func dialPlatform(path string) (net.Conn, error) {
+	return winio.DialPipe(path, nil)
+}
