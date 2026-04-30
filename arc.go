@@ -1,6 +1,3 @@
-// Package arc provides the application lifecycle and top-level entry point
-// for building native desktop applications backed by a platform-native WebView
-// renderer (arc-host).
 package arc
 
 import (
@@ -22,59 +19,33 @@ import (
 	"github.com/carbon-os/arc/window"
 )
 
+// HostConfig controls how the arc-host process is located or connected to.
+type HostConfig struct {
+	// Path is the absolute (or relative) path to the arc-host binary.
+	// Default: looks for arc-host next to the running executable.
+	Path string
+
+	// Channel is a pre-negotiated channel id. When non-empty, arc will NOT
+	// spawn arc-host — it will connect to the already-running instance at
+	// the socket / named-pipe derived from this id.
+	// Useful for tests or when arc-host is managed externally.
+	Channel string
+}
+
 // AppConfig configures the application.
 type AppConfig struct {
 	// Human-readable name shown as the default window title.
 	Title string
 
-	// Emit verbose logs from the renderer and SDK.  Default false.
+	// Emit verbose logs from arc-host and the SDK. Default false.
 	Logging bool
 
-	// RendererPath overrides the location of the arc-host binary.
-	// Default: looks for arc-host next to the current executable.
-	RendererPath string
-
-	// Ipc lets the caller skip automatic renderer spawning and instead hand
-	// Arc a pre-negotiated channel id (e.g. in tests).
-	// Leave zero-value to let Arc spawn arc-host automatically.
-	Ipc ipc.Config
+	// Host controls arc-host binary location and connection.
+	// Leave zero-value for automatic discovery next to the executable.
+	Host HostConfig
 }
 
-// App is the top-level application handle.
-type App struct {
-	cfg AppConfig
-
-	// transport
-	conn    net.Conn
-	writeMu sync.Mutex
-
-	// FIFO queue of pending window_ready / view_ready resolutions.
-	// Arc-host processes commands in order and responds in order, so
-	// a simple FIFO is sufficient to match responses to requests.
-	pendingMu sync.Mutex
-	pending   []pendingEntry
-
-	// registered window and view handles keyed by renderer-assigned id
-	winMu   sync.RWMutex
-	windows map[string]*window.Window
-
-	viewMu sync.RWMutex
-	views  map[string]*webview.WebView
-
-	// lifecycle callbacks
-	onReady func()
-	onClose func() bool
-
-	// closed when the reader loop exits
-	done chan struct{}
-}
-
-type pendingEntry struct {
-	event   string // "window_ready" or "view_ready"
-	resolve func(id string)
-}
-
-// NewApp constructs an App.  No renderer is spawned yet.
+// NewApp constructs an App. No host process is spawned yet.
 func NewApp(cfg AppConfig) *App {
 	return &App{
 		cfg:     cfg,
@@ -84,19 +55,43 @@ func NewApp(cfg AppConfig) *App {
 	}
 }
 
-// OnReady registers a callback that fires once the renderer is connected and
-// ready to accept commands.  Exactly one call.  Must be called before Run.
-func (a *App) OnReady(fn func()) { a.onReady = fn }
+// App is the top-level application handle.
+type App struct {
+	cfg AppConfig
 
-// OnClose registers a callback that fires when the last window closes or the
-// user asks to quit.  Return true to allow the quit, false to cancel it.
-func (a *App) OnClose(fn func() bool) { a.onClose = fn }
+	conn    net.Conn
+	writeMu sync.Mutex
 
-// NewWindow creates a new native window.  Must be called from inside the
-// OnReady callback (or any goroutine after ready has fired).
+	pendingMu sync.Mutex
+	pending   []pendingEntry
+
+	winMu   sync.RWMutex
+	windows map[string]*window.Window
+
+	viewMu sync.RWMutex
+	views  map[string]*webview.WebView
+
+	onReady func()
+	onClose func() // bool removed: "closed" fires after NSApp has already exited, nothing to veto
+
+	done chan struct{}
+}
+
+type pendingEntry struct {
+	event   string
+	resolve func(id string)
+}
+
+func (a *App) OnReady(fn func())      { a.onReady = fn }
+func (a *App) OnClose(fn func())      { a.onClose = fn }
+
 func (a *App) NewWindow(cfg window.Config) *window.Window {
 	win := window.New(cfg, a.sendJSON, a.newWebViewFn)
 
+	// NOTE: pending entries are consumed FIFO per event type.
+	// window_ready entries must be resolved in the same order the host emits them,
+	// which matches the order window_create commands were sent — safe as long as
+	// commands are written serially (they are, via writeMu).
 	a.pendingMu.Lock()
 	a.pending = append(a.pending, pendingEntry{
 		event: "window_ready",
@@ -113,11 +108,10 @@ func (a *App) NewWindow(cfg window.Config) *window.Window {
 	return win
 }
 
-// newWebViewFn is passed to window.Window so it can create WebViews without
-// importing the arc package (avoiding a circular dependency).
 func (a *App) newWebViewFn(windowID string, cfg webview.Config) *webview.WebView {
 	view := webview.New(cfg, a.sendJSON, a.sendBinaryMsg)
 
+	// Same FIFO ordering assumption as NewWindow above.
 	a.pendingMu.Lock()
 	a.pending = append(a.pending, pendingEntry{
 		event: "view_ready",
@@ -134,8 +128,6 @@ func (a *App) newWebViewFn(windowID string, cfg webview.Config) *webview.WebView
 	return view
 }
 
-// Run starts the renderer process (unless Ipc.Channel is set), blocks on
-// reading the event stream, and returns when the app has quit.
 func (a *App) Run() error {
 	conn, err := a.connect()
 	if err != nil {
@@ -148,49 +140,48 @@ func (a *App) Run() error {
 	return nil
 }
 
-// Quit requests a clean application exit from any goroutine.
 func (a *App) Quit() {
 	a.sendJSON(map[string]any{"cmd": "quit"})
 }
 
-// ── Renderer connection ───────────────────────────────────────────────────────
+// ── Connection ────────────────────────────────────────────────────────────────
 
 func (a *App) connect() (net.Conn, error) {
-	if a.cfg.Ipc.Channel != "" {
-		path := channelToPath(a.cfg.Ipc.Channel)
-		return dialRenderer(path)
+	// Pre-negotiated channel — connect directly, no spawn.
+	if a.cfg.Host.Channel != "" {
+		return dialRenderer(channelToPath(a.cfg.Host.Channel))
 	}
 
-	// Locate the arc-host binary.
-	rendererPath := a.cfg.RendererPath
-	if rendererPath == "" {
+	// Locate arc-host binary.
+	hostPath := a.cfg.Host.Path
+	if hostPath == "" {
 		exe, err := os.Executable()
 		if err != nil {
-			return nil, fmt.Errorf("arc: find executable: %w", err)
+			return nil, fmt.Errorf("arc: locate executable: %w", err)
 		}
-		rendererPath = filepath.Join(filepath.Dir(exe), "arc-host")
+		hostPath = filepath.Join(filepath.Dir(exe), "arc-host")
 		if runtime.GOOS == "windows" {
-			rendererPath += ".exe"
+			hostPath += ".exe"
 		}
 	}
 
-	// Build argument list.
 	var args []string
 	if a.cfg.Logging {
 		args = append(args, "--logging")
 	}
 
-	// Spawn arc-host.  It writes the socket/pipe path to stdout, then waits.
-	cmd := exec.Command(rendererPath, args...)
+	cmd := exec.Command(hostPath, args...)
+	cmd.Stderr = os.Stderr
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("arc: stdout pipe: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("arc: start arc-host at %s: %w", rendererPath, err)
+		return nil, fmt.Errorf("arc: spawn arc-host (%s): %w", hostPath, err)
 	}
 
-	// Read the socket path arc-host writes to its stdout.
+	// arc-host writes the socket path to stdout before blocking on accept().
 	scanner := bufio.NewScanner(stdout)
 	if !scanner.Scan() {
 		_ = cmd.Process.Kill()
@@ -198,16 +189,17 @@ func (a *App) connect() (net.Conn, error) {
 	}
 	socketPath := strings.TrimSpace(scanner.Text())
 
+	// Drain the rest of stdout so arc-host never blocks on a full pipe.
+	go io.Copy(io.Discard, stdout)
+
 	conn, err := dialRenderer(socketPath)
 	if err != nil {
 		_ = cmd.Process.Kill()
-		return nil, fmt.Errorf("arc: connect to renderer at %s: %w", socketPath, err)
+		return nil, fmt.Errorf("arc: connect to arc-host at %s: %w", socketPath, err)
 	}
 	return conn, nil
 }
 
-// channelToPath derives the socket / named-pipe path from a bare channel id,
-// mirroring the C++ id_to_path() logic in arc.cpp and arc_host_main.cpp.
 func channelToPath(id string) string {
 	if runtime.GOOS == "windows" {
 		return `\\.\pipe\arc-` + id
@@ -219,33 +211,23 @@ func channelToPath(id string) string {
 	return tmp + "/arc-" + id + ".sock"
 }
 
-// ── Event reader loop ─────────────────────────────────────────────────────────
+// ── Event reader ──────────────────────────────────────────────────────────────
 
-// readLoop reads frames from arc-host until the connection closes or a
-// "closed" event is received.  Blocks — called from Run on the caller's goroutine.
 func (a *App) readLoop() {
 	defer close(a.done)
-
 	for {
 		typ, payload, err := a.readFrame()
 		if err != nil {
-			return // EOF or connection closed → app done
+			return
 		}
-
-		switch typ {
-		case 0x01: // JSON frame
-			stop := a.dispatchJSON(payload)
-			if stop {
+		if typ == 0x01 {
+			if stop := a.dispatchJSON(payload); stop {
 				return
 			}
-		// 0x02 binary frames are consumed inline inside dispatchJSON for
-		// ipc_binary; a standalone binary frame here is unexpected.
 		}
 	}
 }
 
-// dispatchJSON handles a JSON event frame.  Returns true when the read loop
-// should stop (i.e. a "closed" event was received).
 func (a *App) dispatchJSON(payload []byte) (stop bool) {
 	var j map[string]any
 	if err := json.Unmarshal(payload, &j); err != nil {
@@ -260,16 +242,11 @@ func (a *App) dispatchJSON(payload []byte) (stop bool) {
 		}
 
 	case "closed":
-		// Renderer is shutting down.  Honor the OnClose gate if set.
+		// Fired after NSApp has already exited — inform the caller, then stop.
 		if a.onClose != nil {
-			if !a.onClose() {
-				// User cancelled — but arc-host is already quitting.
-				// Nothing meaningful we can do; just let it close.
-			}
+			a.onClose()
 		}
-		return true // signal readLoop to exit
-
-	// ── Window events ─────────────────────────────────────────────────────
+		return true
 
 	case "window_ready":
 		wid, _ := j["window_id"].(string)
@@ -298,15 +275,23 @@ func (a *App) dispatchJSON(payload []byte) (stop bool) {
 			win.DispatchEvent(event, j)
 		}
 
-	// ── View events ───────────────────────────────────────────────────────
-
 	case "view_ready":
 		vid, _ := j["view_id"].(string)
 		if fn := a.popPending("view_ready"); fn != nil {
 			fn(vid)
 		}
 
-	// ipc_binary: the binary payload follows immediately as the next frame.
+	// ipc_text is listed explicitly so it doesn't fall through to the generic
+	// view-event default branch (which would also work today, but is fragile).
+	case "ipc_text":
+		vid, _ := j["view_id"].(string)
+		a.viewMu.RLock()
+		view := a.views[vid]
+		a.viewMu.RUnlock()
+		if view != nil {
+			view.DispatchEvent(event, j, nil)
+		}
+
 	case "ipc_binary":
 		_, binPayload, err := a.readFrame()
 		if err != nil {
@@ -321,7 +306,7 @@ func (a *App) dispatchJSON(payload []byte) (stop bool) {
 		}
 
 	default:
-		// All remaining events are scoped to a view_id.
+		// All remaining events that carry a view_id are routed to the WebView.
 		if vid, ok := j["view_id"].(string); ok && vid != "" {
 			a.viewMu.RLock()
 			view := a.views[vid]
@@ -362,8 +347,6 @@ func (a *App) readFrame() (typ byte, payload []byte, err error) {
 	return
 }
 
-// sendJSON marshals v and sends it as a JSON frame.
-// Safe to call from any goroutine.
 func (a *App) sendJSON(v any) {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -372,9 +355,6 @@ func (a *App) sendJSON(v any) {
 	a.writeFrame(0x01, b)
 }
 
-// sendBinaryMsg sends a JSON frame and a binary frame atomically.
-// Used for webview_post_binary where the renderer expects both frames
-// back-to-back.  Safe to call from any goroutine.
 func (a *App) sendBinaryMsg(jsonCmd any, data []byte) {
 	b, err := json.Marshal(jsonCmd)
 	if err != nil {
@@ -399,7 +379,6 @@ func (a *App) writeFrameLocked(typ byte, payload []byte) {
 	var hdr [5]byte
 	hdr[0] = typ
 	binary.LittleEndian.PutUint32(hdr[1:], uint32(len(payload)))
-	// Two writes under the same lock — no interleaving possible.
 	_, _ = a.conn.Write(hdr[:])
 	if len(payload) > 0 {
 		_, _ = a.conn.Write(payload)
@@ -410,51 +389,25 @@ func (a *App) writeFrameLocked(typ byte, payload []byte) {
 
 func windowCreateCmd(cfg window.Config) map[string]any {
 	cmd := map[string]any{
-		"cmd":          "window_create",
-		"title":        cfg.Title,
-		"width":        cfg.Width,
-		"height":       cfg.Height,
-		"min_width":    cfg.MinWidth,
-		"min_height":   cfg.MinHeight,
-		"max_width":    cfg.MaxWidth,
-		"max_height":   cfg.MaxHeight,
-		"resizable":    cfg.Resizable,
-		"center":       cfg.Center,
-		"frameless":    cfg.Frameless,
-		"transparent":  cfg.Transparent,
+		"cmd": "window_create", "title": cfg.Title,
+		"width": cfg.Width, "height": cfg.Height,
+		"min_width": cfg.MinWidth, "min_height": cfg.MinHeight,
+		"max_width": cfg.MaxWidth, "max_height": cfg.MaxHeight,
+		"resizable": cfg.Resizable, "center": cfg.Center,
+		"frameless": cfg.Frameless, "transparent": cfg.Transparent,
 		"always_on_top": cfg.AlwaysOnTop,
 	}
-	// Apply defaults to match the C++ session defaults.
-	if cfg.Width == 0 {
-		cmd["width"] = 1280
-	}
-	if cfg.Height == 0 {
-		cmd["height"] = 800
-	}
-	if !cfg.Resizable && cfg.Width == 0 {
-		// Resizable defaults to true; only override when explicitly set.
-		cmd["resizable"] = true
-	}
-	if !cfg.Center && cfg.Width == 0 {
-		cmd["center"] = true
-	}
-
-	// Platform-specific extras.
+	if cfg.Width == 0  { cmd["width"] = 1280 }
+	if cfg.Height == 0 { cmd["height"] = 800 }
 	if cfg.MacVibrancy != "" || cfg.MacTitleBarStyle != "" || cfg.WinMica {
 		plat := map[string]any{}
 		if cfg.MacVibrancy != "" || cfg.MacTitleBarStyle != "" {
 			mac := map[string]any{}
-			if cfg.MacVibrancy != "" {
-				mac["vibrancy"] = cfg.MacVibrancy
-			}
-			if cfg.MacTitleBarStyle != "" {
-				mac["title_bar_style"] = cfg.MacTitleBarStyle
-			}
+			if cfg.MacVibrancy != ""      { mac["vibrancy"] = cfg.MacVibrancy }
+			if cfg.MacTitleBarStyle != "" { mac["title_bar_style"] = cfg.MacTitleBarStyle }
 			plat["mac"] = mac
 		}
-		if cfg.WinMica {
-			plat["win"] = map[string]any{"mica": true}
-		}
+		if cfg.WinMica { plat["win"] = map[string]any{"mica": true} }
 		cmd["platform"] = plat
 	}
 	return cmd
@@ -462,14 +415,11 @@ func windowCreateCmd(cfg window.Config) map[string]any {
 
 func viewCreateCmd(windowID string, cfg webview.Config) map[string]any {
 	return map[string]any{
-		"cmd":       "view_create",
-		"window_id": windowID,
-		"view_type": "webview",
-		"layout":    cfg.Layout,
-		"x":         cfg.X,
-		"y":         cfg.Y,
-		"width":     cfg.Width,
-		"height":    cfg.Height,
-		"z":         cfg.ZOrder,
+		"cmd": "view_create", "window_id": windowID, "view_type": "webview",
+		"layout": cfg.Layout, "x": cfg.X, "y": cfg.Y,
+		"width": cfg.Width, "height": cfg.Height, "z": cfg.ZOrder,
 	}
 }
+
+// keep ipc imported (used by callers via re-export of ipc.Handle)
+var _ = ipc.NewHandle

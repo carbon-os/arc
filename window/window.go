@@ -18,15 +18,15 @@ type Config struct {
 	MaxWidth  int // 0 = unlimited
 	MaxHeight int // 0 = unlimited
 
-	Resizable   bool // default true
-	Center      bool // default true
+	Resizable   bool
+	Center      bool
 	Frameless   bool
 	Transparent bool
 	AlwaysOnTop bool
 
 	// macOS-specific
-	MacVibrancy      string // e.g. "sidebar", "hudWindow"
-	MacTitleBarStyle string // "default" | "hidden"
+	MacVibrancy      string
+	MacTitleBarStyle string
 
 	// Windows-specific
 	WinMica bool
@@ -39,8 +39,9 @@ type (
 
 // Window is a handle to a native application window.
 type Window struct {
-	mu sync.Mutex
-	id string
+	mu    sync.Mutex
+	id    string
+	ready bool // true once SetID has been called
 
 	send       sendFn
 	newWebView newWebViewFn
@@ -58,16 +59,17 @@ type Window struct {
 	onBlur   func()
 }
 
-// New creates a Window.  Called by arc internals.
+// New creates a Window. Called by arc internals.
 func New(cfg Config, send sendFn, newWebView newWebViewFn) *Window {
 	return &Window{send: send, newWebView: newWebView}
 }
 
 // SetID is called by arc internals when the renderer assigns a window id.
-// It triggers the OnReady callback.
+// It triggers the OnReady callback if one has already been registered.
 func (w *Window) SetID(id string) {
 	w.mu.Lock()
 	w.id = id
+	w.ready = true
 	fn := w.onReady
 	w.mu.Unlock()
 	if fn != nil {
@@ -83,10 +85,19 @@ func (w *Window) getID() string {
 
 // ── Events ────────────────────────────────────────────────────────────────────
 
-// OnReady fires once the renderer has created the native window and its
-// underlying WebView is ready to receive commands.
-func (w *Window) OnReady(fn func()) { w.mu.Lock(); w.onReady = fn; w.mu.Unlock() }
-func (w *Window) OnClose(fn func()) { w.mu.Lock(); w.onClose = fn; w.mu.Unlock() }
+// OnReady registers fn to be called once the native window is ready.
+// If the window is already ready when OnReady is called, fn is called immediately.
+func (w *Window) OnReady(fn func()) {
+	w.mu.Lock()
+	already := w.ready
+	w.onReady = fn
+	w.mu.Unlock()
+	if already {
+		fn()
+	}
+}
+
+func (w *Window) OnClose(fn func())  { w.mu.Lock(); w.onClose = fn; w.mu.Unlock() }
 func (w *Window) OnResize(fn func(width, height int)) {
 	w.mu.Lock(); w.onResize = fn; w.mu.Unlock()
 }
@@ -96,16 +107,8 @@ func (w *Window) OnBlur(fn func())         { w.mu.Lock(); w.onBlur = fn; w.mu.Un
 
 // ── Content (convenience wrappers over an implicit root WebView) ──────────────
 
-// LoadHTML loads HTML into a lazily-created root WebView.
-// Must be called from within OnReady or after.
 func (w *Window) LoadHTML(html string) { w.rootWebView().LoadHTML(html) }
-
-// LoadURL loads a URL into a lazily-created root WebView.
-// Must be called from within OnReady or after.
-func (w *Window) LoadURL(url string) { w.rootWebView().LoadURL(url) }
-
-// LoadFile loads a local file into a lazily-created root WebView.
-// Must be called from within OnReady or after.
+func (w *Window) LoadURL(url string)   { w.rootWebView().LoadURL(url) }
 func (w *Window) LoadFile(path string) { w.rootWebView().LoadFile(path) }
 
 func (w *Window) rootWebView() *webview.WebView {
@@ -155,8 +158,6 @@ func (w *Window) Close() {
 
 // ── DispatchEvent — called by arc internals ───────────────────────────────────
 
-// DispatchEvent routes an inbound window event to the appropriate handler.
-// Called from the reader goroutine — handlers must not block.
 func (w *Window) DispatchEvent(event string, j map[string]any) {
 	w.mu.Lock()
 	onClose  := w.onClose

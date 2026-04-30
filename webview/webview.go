@@ -11,16 +11,10 @@ import (
 
 // Config holds WebView creation parameters.
 type Config struct {
-	// "root"    — fills the window content area and resizes with it.
-	// "overlay" — absolutely positioned; X/Y/Width/Height are required.
-	// Defaults to "overlay".
-	Layout string
-
+	Layout        string
 	X, Y          int
 	Width, Height int
-
-	// Z-order within the window.  Higher = on top.  Default 0.
-	ZOrder int
+	ZOrder        int
 }
 
 func (c Config) layout() string {
@@ -32,14 +26,14 @@ func (c Config) layout() string {
 
 // NewWindowPolicy is the return value of an OnNewWindowRequested handler.
 type NewWindowPolicy struct {
-	Action      string // "allow" | "deny" | "redirect"
-	RedirectURL string // used when Action == "redirect"
+	Action      string
+	RedirectURL string
 }
 
 // DownloadPolicy is the return value of an OnDownloadRequested handler.
 type DownloadPolicy struct {
-	Action   string // "allow" | "deny"
-	SavePath string // required when Action == "allow"
+	Action   string
+	SavePath string
 }
 
 type (
@@ -49,8 +43,9 @@ type (
 
 // WebView is a handle to a renderer WebView.
 type WebView struct {
-	mu sync.Mutex
-	id string
+	mu    sync.Mutex
+	id    string
+	ready bool // true once SetID has been called
 
 	send    sendFn
 	sendBin sendBinFn
@@ -58,39 +53,33 @@ type WebView struct {
 	ipcOnce   sync.Once
 	ipcHandle *ipc.Handle
 
-	// lifecycle
 	onReady   func()
 	onDestroy func()
 
-	// navigation events
 	onLoadStart  func(url string)
 	onLoadFinish func(url string)
 	onLoadError  func(url string, code int, description string)
 	onURLChanged func(url string)
 	onNewWindow  func(url string) NewWindowPolicy
 
-	// permission events
-	onPermission  func(permType string) bool
-	onGeolocate   func(origin string) bool
-	onAuth        func(url string) (user, pass string)
-	onCertError   func(url string) bool
-	onDownload    func(url string) DownloadPolicy
+	onPermission func(permType string) bool
+	onGeolocate  func(origin string) bool
+	onAuth       func(url string) (user, pass string)
+	onCertError  func(url string) bool
+	onDownload   func(url string) DownloadPolicy
 
-	// pending Eval callbacks keyed by req_id
 	evalMu   sync.Mutex
 	evalPend map[string]func(result string)
 	evalSeq  atomic.Uint64
 
-	// pending GetURL callbacks (FIFO — no req_id in protocol)
 	urlMu  sync.Mutex
 	urlCbs []func(url string)
 
-	// pending GetZoom callbacks (FIFO — no req_id in protocol)
 	zoomMu  sync.Mutex
 	zoomCbs []func(factor float64)
 }
 
-// New creates a WebView.  Called by arc internals.
+// New creates a WebView. Called by arc internals.
 func New(cfg Config, send sendFn, sendBin sendBinFn) *WebView {
 	return &WebView{
 		send:     send,
@@ -100,10 +89,11 @@ func New(cfg Config, send sendFn, sendBin sendBinFn) *WebView {
 }
 
 // SetID is called by arc internals once the renderer has assigned a view id.
-// It triggers the OnReady callback.
+// It triggers the OnReady callback if one has already been registered.
 func (v *WebView) SetID(id string) {
 	v.mu.Lock()
 	v.id = id
+	v.ready = true
 	fn := v.onReady
 	v.mu.Unlock()
 	if fn != nil {
@@ -118,22 +108,31 @@ func (v *WebView) getID() string {
 }
 
 // IPC returns the IPC handle scoped to this WebView's JS context.
-// This is the only source of IPC — windows have no JS context of their own.
+// Send/SendBytes must not be called before OnReady fires — the view_id is
+// empty until then and the command would be silently dropped by the host.
 func (v *WebView) IPC() *ipc.Handle {
 	v.ipcOnce.Do(func() {
 		v.ipcHandle = ipc.NewHandle(
 			func(channel, payload string) {
+				id := v.getID()
+				if id == "" {
+					return
+				}
 				v.send(map[string]any{
 					"cmd":     "webview_post_text",
-					"view_id": v.getID(),
+					"view_id": id,
 					"channel": channel,
 					"payload": payload,
 				})
 			},
 			func(channel string, data []byte) {
+				id := v.getID()
+				if id == "" {
+					return
+				}
 				v.sendBin(map[string]any{
 					"cmd":     "webview_post_binary",
-					"view_id": v.getID(),
+					"view_id": id,
 					"channel": channel,
 				}, data)
 			},
@@ -144,7 +143,18 @@ func (v *WebView) IPC() *ipc.Handle {
 
 // ── Lifecycle events ──────────────────────────────────────────────────────────
 
-func (v *WebView) OnReady(fn func())   { v.mu.Lock(); v.onReady = fn; v.mu.Unlock() }
+// OnReady registers fn to be called once the renderer view is ready.
+// If the view is already ready when OnReady is called, fn is called immediately.
+func (v *WebView) OnReady(fn func()) {
+	v.mu.Lock()
+	already := v.ready
+	v.onReady = fn
+	v.mu.Unlock()
+	if already {
+		fn()
+	}
+}
+
 func (v *WebView) OnDestroy(fn func()) { v.mu.Lock(); v.onDestroy = fn; v.mu.Unlock() }
 
 // ── Navigation events ─────────────────────────────────────────────────────────
@@ -233,8 +243,6 @@ func (v *WebView) Reload() {
 func (v *WebView) Stop() {
 	v.send(map[string]any{"cmd": "webview_stop", "view_id": v.getID()})
 }
-
-// GetURL asynchronously retrieves the current URL; fn is called with the result.
 func (v *WebView) GetURL(fn func(url string)) {
 	v.urlMu.Lock()
 	v.urlCbs = append(v.urlCbs, fn)
@@ -244,8 +252,6 @@ func (v *WebView) GetURL(fn func(url string)) {
 
 // ── JavaScript ────────────────────────────────────────────────────────────────
 
-// Eval executes a JS expression.  If fn is non-nil the result string is passed
-// to it asynchronously (called from the internal reader goroutine — do not block).
 func (v *WebView) Eval(js string, fn func(result string)) {
 	var reqID string
 	if fn != nil {
@@ -266,8 +272,6 @@ func (v *WebView) Eval(js string, fn func(result string)) {
 func (v *WebView) SetZoom(factor float64) {
 	v.send(map[string]any{"cmd": "webview_set_zoom", "view_id": v.getID(), "factor": factor})
 }
-
-// GetZoom asynchronously retrieves the zoom factor; fn is called with the result.
 func (v *WebView) GetZoom(fn func(factor float64)) {
 	v.zoomMu.Lock()
 	v.zoomCbs = append(v.zoomCbs, fn)
@@ -295,11 +299,7 @@ func (v *WebView) FindStop() {
 
 // ── DispatchEvent — called by arc internals ───────────────────────────────────
 
-// DispatchEvent routes an inbound event to the appropriate handler.
-// binary is non-nil only for "ipc_binary" events (the following frame).
-// Called from the reader goroutine — handlers must not block.
 func (v *WebView) DispatchEvent(event string, j map[string]any, binary []byte) {
-	// snapshot callbacks under lock to avoid holding it during calls
 	v.mu.Lock()
 	snap := struct {
 		onLoadStart  func(string)
@@ -307,11 +307,11 @@ func (v *WebView) DispatchEvent(event string, j map[string]any, binary []byte) {
 		onLoadError  func(string, int, string)
 		onURLChanged func(string)
 		onNewWindow  func(string) NewWindowPolicy
-		onPermission  func(string) bool
-		onGeolocate   func(string) bool
-		onAuth        func(string) (string, string)
-		onCertError   func(string) bool
-		onDownload    func(string) DownloadPolicy
+		onPermission func(string) bool
+		onGeolocate  func(string) bool
+		onAuth       func(string) (string, string)
+		onCertError  func(string) bool
+		onDownload   func(string) DownloadPolicy
 		onDestroy    func()
 	}{
 		v.onLoadStart, v.onLoadFinish, v.onLoadError, v.onURLChanged, v.onNewWindow,
@@ -326,12 +326,10 @@ func (v *WebView) DispatchEvent(event string, j map[string]any, binary []byte) {
 		if snap.onLoadStart != nil {
 			snap.onLoadStart(strField(j, "url"))
 		}
-
 	case "load_finish":
 		if snap.onLoadFinish != nil {
 			snap.onLoadFinish(strField(j, "url"))
 		}
-
 	case "load_error":
 		if snap.onLoadError != nil {
 			code := 0
@@ -340,12 +338,10 @@ func (v *WebView) DispatchEvent(event string, j map[string]any, binary []byte) {
 			}
 			snap.onLoadError(strField(j, "url"), code, strField(j, "description"))
 		}
-
 	case "url_changed":
 		if snap.onURLChanged != nil {
 			snap.onURLChanged(strField(j, "url"))
 		}
-
 	case "new_window_requested":
 		url := strField(j, "url")
 		policy := NewWindowPolicy{Action: "deny"}
@@ -360,7 +356,6 @@ func (v *WebView) DispatchEvent(event string, j map[string]any, binary []byte) {
 			cmd["redirect_url"] = policy.RedirectURL
 		}
 		v.send(cmd)
-
 	case "permission_requested":
 		permType := strField(j, "type")
 		granted := false
@@ -371,7 +366,6 @@ func (v *WebView) DispatchEvent(event string, j map[string]any, binary []byte) {
 			"cmd": "webview_permission_response", "view_id": vid,
 			"type": permType, "granted": granted,
 		})
-
 	case "geolocation_requested":
 		origin := strField(j, "origin")
 		granted := false
@@ -382,7 +376,6 @@ func (v *WebView) DispatchEvent(event string, j map[string]any, binary []byte) {
 			"cmd": "webview_geolocation_response", "view_id": vid,
 			"origin": origin, "granted": granted,
 		})
-
 	case "auth_required":
 		url := strField(j, "url")
 		user, pass := "", ""
@@ -393,7 +386,6 @@ func (v *WebView) DispatchEvent(event string, j map[string]any, binary []byte) {
 			"cmd": "webview_auth_response", "view_id": vid,
 			"username": user, "password": pass,
 		})
-
 	case "certificate_error":
 		url := strField(j, "url")
 		proceed := false
@@ -404,7 +396,6 @@ func (v *WebView) DispatchEvent(event string, j map[string]any, binary []byte) {
 			"cmd": "webview_certificate_response", "view_id": vid,
 			"proceed": proceed,
 		})
-
 	case "download_requested":
 		url := strField(j, "url")
 		dp := DownloadPolicy{Action: "deny"}
@@ -419,18 +410,15 @@ func (v *WebView) DispatchEvent(event string, j map[string]any, binary []byte) {
 			cmd["save_path"] = dp.SavePath
 		}
 		v.send(cmd)
-
 	case "ipc_text":
 		if v.ipcHandle != nil {
 			v.ipcHandle.Deliver(strField(j, "channel"),
 				ipc.NewTextMessage(strField(j, "payload")))
 		}
-
 	case "ipc_binary":
 		if v.ipcHandle != nil {
 			v.ipcHandle.Deliver(strField(j, "channel"), ipc.NewBinaryMessage(binary))
 		}
-
 	case "eval_result":
 		reqID := strField(j, "req_id")
 		v.evalMu.Lock()
@@ -440,7 +428,6 @@ func (v *WebView) DispatchEvent(event string, j map[string]any, binary []byte) {
 		if fn != nil {
 			fn(strField(j, "result"))
 		}
-
 	case "webview_url":
 		v.urlMu.Lock()
 		var fn func(string)
@@ -451,7 +438,6 @@ func (v *WebView) DispatchEvent(event string, j map[string]any, binary []byte) {
 		if fn != nil {
 			fn(strField(j, "url"))
 		}
-
 	case "webview_zoom":
 		v.zoomMu.Lock()
 		var fn func(float64)
@@ -466,7 +452,6 @@ func (v *WebView) DispatchEvent(event string, j map[string]any, binary []byte) {
 			}
 			fn(factor)
 		}
-
 	case "view_destroy":
 		if snap.onDestroy != nil {
 			snap.onDestroy()

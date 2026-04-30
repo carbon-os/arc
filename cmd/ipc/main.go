@@ -9,10 +9,13 @@ import (
 	"github.com/carbon-os/arc/window"
 )
 
+const arcHostPath = "/Users/galaxy/Desktop/libarc/build/bin/arc-host"
+
 func main() {
 	app := arc.NewApp(arc.AppConfig{
 		Title:   "IPC Demo",
 		Logging: true,
+		Host:    arc.HostConfig{Path: arcHostPath},
 	})
 
 	app.OnReady(func() {
@@ -27,15 +30,11 @@ func main() {
 			view := win.NewWebView(webview.Config{Layout: "root"})
 			h := view.IPC()
 
-			// ── Go → JS ──────────────────────────────────────────────────────
-			// When the page asks for the time, reply with the current unix timestamp.
 			h.On("get-time", func(msg ipc.Message) {
 				log.Printf("[go] got get-time from JS: %q", msg.Text())
-				h.Send("time", msg.Text()) // echo the request id back with the reply
+				h.Send("time", msg.Text())
 			})
 
-			// ── JS → Go ──────────────────────────────────────────────────────
-			// Log every "log" message that JS posts.
 			h.On("log", func(msg ipc.Message) {
 				log.Printf("[js] %s", msg.Text())
 			})
@@ -46,7 +45,9 @@ func main() {
 		})
 	})
 
-	app.OnClose(func() bool { return true })
+	app.OnClose(func() {
+		log.Println("app closed")
+	})
 
 	if err := app.Run(); err != nil {
 		log.Fatal(err)
@@ -60,34 +61,19 @@ const ui = `<!DOCTYPE html>
 <title>IPC Demo</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-
   body {
     font-family: system-ui, sans-serif;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    height: 100vh;
-    gap: 16px;
-    background: #f5f5f5;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    height: 100vh; gap: 16px; background: #f5f5f5;
   }
-
   button {
-    padding: 10px 28px;
-    font-size: 15px;
-    border: none;
-    border-radius: 8px;
-    background: #0066ff;
-    color: #fff;
-    cursor: pointer;
+    padding: 10px 28px; font-size: 15px;
+    border: none; border-radius: 8px;
+    background: #0066ff; color: #fff; cursor: pointer;
   }
   button:active { opacity: .8; }
-
-  #out {
-    font-size: 13px;
-    color: #444;
-    min-height: 20px;
-  }
+  #out { font-size: 13px; color: #444; min-height: 20px; }
 </style>
 </head>
 <body>
@@ -101,15 +87,14 @@ const ui = `<!DOCTYPE html>
   document.getElementById('btn').addEventListener('click', () => {
     const id = String(++seq);
 
-    // Listen for exactly one reply on "time".
-    arc.on('time', (payload) => {
-      arc.off('time');
+    ipc.on('time', (payload) => {
+      ipc.off('time');
       document.getElementById('out').textContent = 'Go replied: ' + payload;
-      arc.post('log', 'received reply for request ' + payload);
+      ipc.post('log', 'received reply for request ' + payload);
     });
 
-    arc.post('get-time', id);
-    arc.post('log', 'sent get-time request ' + id);
+    ipc.post('get-time', id);
+    ipc.post('log', 'sent get-time request ' + id);
   });
 </script>
 
