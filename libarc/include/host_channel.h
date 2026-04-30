@@ -73,6 +73,7 @@ enum class Event : uint8_t {
     IpcBinary       = 0x84,
     BillingProducts = 0x85,
     BillingPurchase = 0x86,
+    Resized         = 0x87,
 };
 
 // ── Billing wire types ────────────────────────────────────────────────────────
@@ -148,6 +149,7 @@ public:
 
     // Non-blocking sends — enqueue and return immediately.
     void send_event(Event type);
+    void send_resized(int width, int height);
     void send_ipc_text(std::string_view channel, std::string_view text);
     void send_ipc_binary(std::string_view channel, const std::vector<uint8_t>& data);
     void send_billing_products(const std::vector<BillingProductInfo>& products);

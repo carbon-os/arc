@@ -17,7 +17,6 @@ static uint32_t le32_dec(const uint8_t* p)
          | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-// Decode a uint32 on the wire as a signed int32 (two's complement passthrough).
 static int32_t le32_dec_signed(const uint8_t* p)
 {
     return static_cast<int32_t>(le32_dec(p));
@@ -231,7 +230,6 @@ bool HostChannel::read_frame(InboundFrame& out)
     // ── Embedded web view commands ────────────────────────────────────────────
 
     case Command::WebViewCreate:
-        // id:u32  x:i32  y:i32  width:u32  height:u32  zorder:i32
         out.wv_id     = read_u32();
         out.wv_x      = read_i32();
         out.wv_y      = read_i32();
@@ -243,7 +241,6 @@ bool HostChannel::read_frame(InboundFrame& out)
     case Command::WebViewLoadURL:
     case Command::WebViewLoadFile:
     case Command::WebViewLoadHTML:
-        // id:u32  content:str
         out.wv_id = read_u32();
         out.str   = read_str();
         break;
@@ -251,26 +248,22 @@ bool HostChannel::read_frame(InboundFrame& out)
     case Command::WebViewShow:
     case Command::WebViewHide:
     case Command::WebViewDestroy:
-        // id:u32
         out.wv_id = read_u32();
         break;
 
     case Command::WebViewMove:
-        // id:u32  x:i32  y:i32
         out.wv_id = read_u32();
         out.wv_x  = read_i32();
         out.wv_y  = read_i32();
         break;
 
     case Command::WebViewResize:
-        // id:u32  width:u32  height:u32
         out.wv_id     = read_u32();
         out.wv_width  = static_cast<int>(read_u32());
         out.wv_height = static_cast<int>(read_u32());
         break;
 
     case Command::WebViewSetBounds:
-        // id:u32  x:i32  y:i32  width:u32  height:u32
         out.wv_id     = read_u32();
         out.wv_x      = read_i32();
         out.wv_y      = read_i32();
@@ -279,7 +272,6 @@ bool HostChannel::read_frame(InboundFrame& out)
         break;
 
     case Command::WebViewSetZOrder:
-        // id:u32  zorder:i32
         out.wv_id     = read_u32();
         out.wv_zorder = read_i32();
         break;
@@ -298,6 +290,17 @@ bool HostChannel::read_frame(InboundFrame& out)
 void HostChannel::send_event(Event type)
 {
     std::vector<uint8_t> payload{ static_cast<uint8_t>(type) };
+    enqueue(make_frame(payload));
+}
+
+void HostChannel::send_resized(int width, int height)
+{
+    logger::Info("HostChannel: send_resized %dx%d", width, height);
+    std::vector<uint8_t> payload;
+    payload.reserve(9);
+    payload.push_back(static_cast<uint8_t>(Event::Resized));
+    le32_enc(payload, static_cast<uint32_t>(width));
+    le32_enc(payload, static_cast<uint32_t>(height));
     enqueue(make_frame(payload));
 }
 

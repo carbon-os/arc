@@ -304,6 +304,17 @@ void HostChannel::send_event(Event type)
     enqueue(make_frame(payload));
 }
 
+void HostChannel::send_resized(int width, int height)
+{
+    logger::Info("HostChannel: send_resized %dx%d", width, height);
+    std::vector<uint8_t> payload;
+    payload.reserve(9);
+    payload.push_back(static_cast<uint8_t>(Event::Resized));
+    le32_enc(payload, static_cast<uint32_t>(width));
+    le32_enc(payload, static_cast<uint32_t>(height));
+    enqueue(make_frame(payload));
+}
+
 void HostChannel::send_ipc_text(std::string_view channel, std::string_view text)
 {
     logger::Info("HostChannel: send_ipc_text channel=%.*s",

@@ -57,6 +57,9 @@ type Runtime struct {
 	billingProductsHandler BillingProductsHandler
 	billingPurchaseHandler BillingPurchaseHandler
 
+	resizeMu      sync.RWMutex
+	resizeHandler func(width, height int)
+
 	nextWebViewID uint32 // atomically incremented; zero is reserved
 
 	quit chan struct{}
@@ -203,6 +206,15 @@ func (rt *Runtime) loop() error {
 				return nil
 			}
 
+		case evtResized:
+			rt.log.Printf("[go] loop: evtResized %dx%d", evt.Width, evt.Height)
+			rt.resizeMu.RLock()
+			h := rt.resizeHandler
+			rt.resizeMu.RUnlock()
+			if h != nil {
+				go h(evt.Width, evt.Height)
+			}
+
 		case evtIpcText:
 			rt.log.Printf("[go] loop: evtIpcText channel=%q text=%q", evt.Channel, evt.Text)
 			go rt.dispatch(evt.Channel, evt.Text, nil, false)
@@ -284,6 +296,16 @@ func (rt *Runtime) OffMessage(channel string) {
 	delete(rt.handlers, channel)
 	rt.handlersMu.Unlock()
 	rt.log.Printf("[go] OffMessage: removed channel=%q", channel)
+}
+
+// OnResize registers a handler that fires on every window resize event.
+// width and height are the new content area dimensions in pixels.
+// Replaces any previously registered handler.
+func (rt *Runtime) OnResize(h func(width, height int)) {
+	rt.resizeMu.Lock()
+	rt.resizeHandler = h
+	rt.resizeMu.Unlock()
+	rt.log.Println("[go] OnResize: registered")
 }
 
 // OnBillingProducts registers the handler for evtBillingProducts.

@@ -14,6 +14,7 @@ class WebView {
 public:
     using ReadyCallback     = std::function<void()>;
     using ClosedCallback    = std::function<void()>;
+    using ResizeCallback    = std::function<void(int width, int height)>;
     using IpcTextCallback   = std::function<void(std::string_view, std::string_view)>;
     using IpcBinaryCallback = std::function<void(std::string_view, const std::vector<uint8_t>&)>;
 
@@ -25,6 +26,7 @@ public:
 
     void on_ready(ReadyCallback cb);
     void on_closed(ClosedCallback cb);
+    void on_resize(ResizeCallback cb);
     void on_ipc_text(IpcTextCallback cb);
     void on_ipc_binary(IpcBinaryCallback cb);
 
@@ -63,9 +65,6 @@ public:
 
 private:
     void execute_frame(const InboundFrame& f);
-
-    // Re-stack all child panels in ascending zorder using addChildWindow /
-    // orderWindow. Call after any zorder change.
     void embed_restack();
 
     WebViewImpl* impl_;

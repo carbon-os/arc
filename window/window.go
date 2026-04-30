@@ -163,6 +163,13 @@ func (w *BrowserWindow) OnClose(fn func() bool) {
 	w.onClose = fn
 }
 
+// OnResize registers a callback that fires whenever the window is resized.
+// width and height are the new content area dimensions in pixels.
+// Safe to register before or after the window is ready.
+func (w *BrowserWindow) OnResize(fn func(width, height int)) {
+	w.rt.OnResize(fn)
+}
+
 // LoadFile navigates the window to a local HTML file.
 func (w *BrowserWindow) LoadFile(path string) {
 	w.rt.Send(runtime.CmdLoadFile, runtime.EncodeStr(path))

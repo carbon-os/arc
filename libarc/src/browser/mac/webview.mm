@@ -5,10 +5,21 @@
 
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
+#import <QuartzCore/QuartzCore.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+
+// ── ArcFlippedView ────────────────────────────────────────────────────────────
+
+@interface ArcFlippedView : NSView
+@end
+
+@implementation ArcFlippedView
+- (BOOL)isFlipped { return YES; }
+@end
 
 // ── Window delegate ───────────────────────────────────────────────────────────
 
@@ -25,27 +36,18 @@
         self.impl->on_closed_cb();
 }
 
-@end
-
-// ── Coordinate helper ─────────────────────────────────────────────────────────
-//
-// Converts Go window-relative coordinates (origin top-left, Y down) to the
-// screen-coordinate NSRect expected by NSWindow/NSPanel on macOS
-// (origin bottom-left, Y up).
-
-static NSRect embed_screen_rect(const browser::WebViewImpl* impl,
-                                int x, int y, int width, int height)
+- (void)windowDidResize:(NSNotification*)notification
 {
-    NSRect content = [impl->window contentRectForFrameRect:impl->window.frame];
-    CGFloat flipped_y = content.origin.y + content.size.height
-                        - static_cast<CGFloat>(y)
-                        - static_cast<CGFloat>(height);
-    return NSMakeRect(
-        content.origin.x + static_cast<CGFloat>(x),
-        flipped_y,
-        static_cast<CGFloat>(width),
-        static_cast<CGFloat>(height));
+    NSRect content = [self.impl->window
+                          contentRectForFrameRect:self.impl->window.frame];
+    int w = static_cast<int>(content.size.width);
+    int h = static_cast<int>(content.size.height);
+    logger::Info("WebView: windowDidResize %dx%d", w, h);
+    if (self.impl->on_resize_cb)
+        self.impl->on_resize_cb(w, h);
 }
+
+@end
 
 // ── WebView ───────────────────────────────────────────────────────────────────
 
@@ -57,8 +59,6 @@ WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
 
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-
-    // ── WKWebViewConfiguration ────────────────────────────────────────────────
 
     WKWebViewConfiguration* config = [[WKWebViewConfiguration alloc] init];
 
@@ -79,13 +79,6 @@ WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
         logger::Info("WebView: DevTools enabled");
     }
 
-    // ── WKWebView ─────────────────────────────────────────────────────────────
-
-    NSRect frame   = NSMakeRect(0, 0, cfg.width, cfg.height);
-    impl_->webview = [[WKWebView alloc] initWithFrame:frame configuration:config];
-
-    // ── NSWindow ──────────────────────────────────────────────────────────────
-
     const bool hidden_bar = (cfg.titleBarStyle == TitleBarStyle::Hidden);
 
     NSWindowStyleMask style = NSWindowStyleMaskTitled
@@ -96,6 +89,8 @@ WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
     if (hidden_bar)
         style |= NSWindowStyleMaskFullSizeContentView;
 
+    NSRect frame = NSMakeRect(0, 0, cfg.width, cfg.height);
+
     impl_->window = [[NSWindow alloc]
                          initWithContentRect:frame
                                    styleMask:style
@@ -103,13 +98,24 @@ WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
                                        defer:NO];
 
     if (hidden_bar) {
-        impl_->window.titleVisibility           = NSWindowTitleHidden;
+        impl_->window.titleVisibility            = NSWindowTitleHidden;
         impl_->window.titlebarAppearsTransparent = YES;
         logger::Info("WebView: titleBarStyle=Hidden");
     }
 
     [impl_->window setTitle:[NSString stringWithUTF8String:cfg.title.c_str()]];
-    [impl_->window setContentView:impl_->webview];
+
+    ArcFlippedView* container = [[ArcFlippedView alloc] initWithFrame:frame];
+    container.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    container.wantsLayer       = YES;
+    container.layer.masksToBounds = YES;
+    impl_->container = container;
+
+    impl_->webview = [[WKWebView alloc] initWithFrame:frame configuration:config];
+    impl_->webview.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [container addSubview:impl_->webview];
+
+    [impl_->window setContentView:container];
     [impl_->window center];
 
     ArcWindowDelegate* delegate = [[ArcWindowDelegate alloc] init];
@@ -136,6 +142,7 @@ WebView::~WebView() { delete impl_; }
 
 void WebView::on_ready(ReadyCallback cb)          { impl_->on_ready_cb      = std::move(cb); }
 void WebView::on_closed(ClosedCallback cb)        { impl_->on_closed_cb     = std::move(cb); }
+void WebView::on_resize(ResizeCallback cb)        { impl_->on_resize_cb     = std::move(cb); }
 void WebView::on_ipc_text(IpcTextCallback cb)     { impl_->on_ipc_text_cb   = std::move(cb); }
 void WebView::on_ipc_binary(IpcBinaryCallback cb) { impl_->on_ipc_binary_cb = std::move(cb); }
 
@@ -174,30 +181,30 @@ void WebView::drain_cmd_queue()
 void WebView::execute_frame(const InboundFrame& f)
 {
     switch (f.type) {
-    case Command::LoadFile:       load_file(f.str);                          break;
-    case Command::LoadHTML:       load_html(f.str);                          break;
-    case Command::LoadURL:        load_url(f.str);                           break;
-    case Command::Eval:           eval(f.str);                               break;
-    case Command::SetTitle:       set_title(f.str);                          break;
-    case Command::SetSize:        set_size(f.width, f.height);               break;
-    case Command::PostText:       post_text(f.channel, f.text);              break;
-    case Command::PostBinary:     post_binary(f.channel, f.data);            break;
-    case Command::WebViewCreate:  embed_create(f.wv_id, f.wv_x, f.wv_y,
-                                               f.wv_width, f.wv_height,
-                                               f.wv_zorder);                 break;
-    case Command::WebViewLoadURL: embed_load_url(f.wv_id, f.str);            break;
-    case Command::WebViewLoadFile:embed_load_file(f.wv_id, f.str);           break;
-    case Command::WebViewLoadHTML:embed_load_html(f.wv_id, f.str);           break;
-    case Command::WebViewShow:    embed_show(f.wv_id);                       break;
-    case Command::WebViewHide:    embed_hide(f.wv_id);                       break;
-    case Command::WebViewMove:    embed_move(f.wv_id, f.wv_x, f.wv_y);      break;
-    case Command::WebViewResize:  embed_resize(f.wv_id, f.wv_width,
-                                               f.wv_height);                 break;
+    case Command::LoadFile:         load_file(f.str);                          break;
+    case Command::LoadHTML:         load_html(f.str);                          break;
+    case Command::LoadURL:          load_url(f.str);                           break;
+    case Command::Eval:             eval(f.str);                               break;
+    case Command::SetTitle:         set_title(f.str);                          break;
+    case Command::SetSize:          set_size(f.width, f.height);               break;
+    case Command::PostText:         post_text(f.channel, f.text);              break;
+    case Command::PostBinary:       post_binary(f.channel, f.data);            break;
+    case Command::WebViewCreate:    embed_create(f.wv_id, f.wv_x, f.wv_y,
+                                                 f.wv_width, f.wv_height,
+                                                 f.wv_zorder);                 break;
+    case Command::WebViewLoadURL:   embed_load_url(f.wv_id, f.str);            break;
+    case Command::WebViewLoadFile:  embed_load_file(f.wv_id, f.str);           break;
+    case Command::WebViewLoadHTML:  embed_load_html(f.wv_id, f.str);           break;
+    case Command::WebViewShow:      embed_show(f.wv_id);                       break;
+    case Command::WebViewHide:      embed_hide(f.wv_id);                       break;
+    case Command::WebViewMove:      embed_move(f.wv_id, f.wv_x, f.wv_y);      break;
+    case Command::WebViewResize:    embed_resize(f.wv_id, f.wv_width,
+                                                 f.wv_height);                 break;
     case Command::WebViewSetBounds: embed_set_bounds(f.wv_id, f.wv_x,
                                                      f.wv_y, f.wv_width,
-                                                     f.wv_height);           break;
-    case Command::WebViewSetZOrder: embed_set_zorder(f.wv_id, f.wv_zorder);  break;
-    case Command::WebViewDestroy: embed_destroy(f.wv_id);                    break;
+                                                     f.wv_height);             break;
+    case Command::WebViewSetZOrder: embed_set_zorder(f.wv_id, f.wv_zorder);   break;
+    case Command::WebViewDestroy:   embed_destroy(f.wv_id);                    break;
     default:
         logger::Warn("WebView: execute_frame unknown cmd=0x%02X",
                      static_cast<uint8_t>(f.type));
@@ -214,32 +221,20 @@ void WebView::embed_create(uint32_t id, int x, int y, int width, int height, int
         return;
     }
 
-    NSRect screen = embed_screen_rect(impl_, x, y, width, height);
-
-    NSPanel* panel = [[NSPanel alloc]
-                          initWithContentRect:screen
-                                    styleMask:NSWindowStyleMaskBorderless
-                                      backing:NSBackingStoreBuffered
-                                        defer:NO];
-    panel.opaque              = YES;
-    panel.hasShadow           = NO;
-    panel.backgroundColor     = NSColor.clearColor;
-    panel.movableByWindowBackground = NO;
-
     WKWebViewConfiguration* cfg = [[WKWebViewConfiguration alloc] init];
     cfg.websiteDataStore = [WKWebsiteDataStore nonPersistentDataStore];
 
     WKWebView* wv = [[WKWebView alloc]
-                         initWithFrame:NSMakeRect(0, 0, width, height)
+                         initWithFrame:NSMakeRect(x, y, width, height)
                          configuration:cfg];
-    [panel setContentView:wv];
-
-    [impl_->window addChildWindow:panel ordered:NSWindowAbove];
 
     EmbeddedWebView ev;
-    ev.panel   = panel;
     ev.webview = wv;
     ev.zorder  = zorder;
+    ev.x       = x;
+    ev.y       = y;
+    ev.width   = width;
+    ev.height  = height;
     impl_->embeds[id] = ev;
 
     embed_restack();
@@ -280,40 +275,47 @@ void WebView::embed_show(uint32_t id)
 {
     auto it = impl_->embeds.find(id);
     if (it == impl_->embeds.end()) { logger::Warn("WebView: embed_show unknown id=%u", id); return; }
-    [it->second.panel orderFront:nil];
+    [it->second.webview setHidden:NO];
 }
 
 void WebView::embed_hide(uint32_t id)
 {
     auto it = impl_->embeds.find(id);
     if (it == impl_->embeds.end()) { logger::Warn("WebView: embed_hide unknown id=%u", id); return; }
-    [it->second.panel orderOut:nil];
+    [it->second.webview setHidden:YES];
 }
 
 void WebView::embed_move(uint32_t id, int x, int y)
 {
     auto it = impl_->embeds.find(id);
     if (it == impl_->embeds.end()) { logger::Warn("WebView: embed_move unknown id=%u", id); return; }
-    NSRect cur   = it->second.panel.frame;
-    NSRect screen = embed_screen_rect(impl_, x, y,
-                                      static_cast<int>(cur.size.width),
-                                      static_cast<int>(cur.size.height));
-    [it->second.panel setFrameOrigin:screen.origin];
+    it->second.x = x;
+    it->second.y = y;
+    NSRect f     = it->second.webview.frame;
+    f.origin     = NSMakePoint(x, y);
+    [it->second.webview setFrame:f];
 }
 
 void WebView::embed_resize(uint32_t id, int width, int height)
 {
     auto it = impl_->embeds.find(id);
     if (it == impl_->embeds.end()) { logger::Warn("WebView: embed_resize unknown id=%u", id); return; }
-    [it->second.panel setContentSize:NSMakeSize(width, height)];
+    it->second.width  = width;
+    it->second.height = height;
+    NSRect f          = it->second.webview.frame;
+    f.size            = NSMakeSize(width, height);
+    [it->second.webview setFrame:f];
 }
 
 void WebView::embed_set_bounds(uint32_t id, int x, int y, int width, int height)
 {
     auto it = impl_->embeds.find(id);
     if (it == impl_->embeds.end()) { logger::Warn("WebView: embed_set_bounds unknown id=%u", id); return; }
-    NSRect screen = embed_screen_rect(impl_, x, y, width, height);
-    [it->second.panel setFrame:screen display:YES];
+    it->second.x      = x;
+    it->second.y      = y;
+    it->second.width  = width;
+    it->second.height = height;
+    [it->second.webview setFrame:NSMakeRect(x, y, width, height)];
 }
 
 void WebView::embed_set_zorder(uint32_t id, int zorder)
@@ -328,24 +330,27 @@ void WebView::embed_destroy(uint32_t id)
 {
     auto it = impl_->embeds.find(id);
     if (it == impl_->embeds.end()) { logger::Warn("WebView: embed_destroy unknown id=%u", id); return; }
-    [impl_->window removeChildWindow:it->second.panel];
-    [it->second.panel orderOut:nil];
+    [it->second.webview removeFromSuperview];
     impl_->embeds.erase(it);
     logger::Info("WebView: embed_destroy id=%u", id);
 }
 
 void WebView::embed_restack()
 {
-    // Collect and sort by zorder ascending (lower z = further back).
-    std::vector<std::pair<int, NSPanel*>> ordered;
+    std::vector<std::pair<int, WKWebView*>> ordered;
     ordered.reserve(impl_->embeds.size());
     for (auto& [id, ev] : impl_->embeds)
-        ordered.emplace_back(ev.zorder, ev.panel);
+        ordered.emplace_back(ev.zorder, ev.webview);
     std::sort(ordered.begin(), ordered.end(),
               [](const auto& a, const auto& b){ return a.first < b.first; });
 
-    for (auto& [z, panel] : ordered)
-        [panel orderWindow:NSWindowAbove relativeTo:impl_->window.windowNumber];
+    for (auto& [z, wv] : ordered)
+        [wv removeFromSuperviewWithoutNeedingDisplay];
+
+    for (auto& [z, wv] : ordered)
+        [impl_->container addSubview:wv
+                          positioned:NSWindowAbove
+                          relativeTo:nil];
 }
 
 } // namespace browser

@@ -48,6 +48,7 @@ const (
 	evtIpcBinary       evtByte = 0x84
 	evtBillingProducts evtByte = 0x85
 	evtBillingPurchase evtByte = 0x86
+	evtResized         evtByte = 0x87
 )
 
 // ── TitleBarStyle ─────────────────────────────────────────────────────────────
@@ -230,6 +231,8 @@ type Event struct {
 	Channel         string
 	Text            string
 	Data            []byte
+	Width           int
+	Height          int
 	BillingProducts []BillingProduct
 	BillingPurchase BillingPurchaseEvent
 }
@@ -272,6 +275,13 @@ func ReadEvent(r io.Reader) (*Event, error) {
 	switch evt.Type {
 	case evtReady, evtClosed:
 		// no payload
+
+	case evtResized:
+		if len(cur) < 8 {
+			return nil, fmt.Errorf("arc: evtResized truncated (got %d bytes, want 8)", len(cur))
+		}
+		evt.Width = int(binary.LittleEndian.Uint32(cur[0:4]))
+		evt.Height = int(binary.LittleEndian.Uint32(cur[4:8]))
 
 	case evtIpcText:
 		if evt.Channel, err = readStr(); err != nil {
