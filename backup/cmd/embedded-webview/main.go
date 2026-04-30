@@ -57,8 +57,10 @@ func main() {
 		ipcMain := win.IPC()
 
 		// Track visibility so the panel button label stays in sync.
-		// Declared here so the toggle handler can close over it.
+		// Track current window dimensions so we can correctly size the overlay
+		// when it is shown after having been hidden during a resize.
 		visible := false
+		currentW, currentH := winW, winH
 
 		// ── WebView and IPC handlers are wired up once the renderer is ready ──
 
@@ -75,6 +77,16 @@ func main() {
 			overlay.LoadURL("https://www.google.com")
 			overlay.Show()
 			visible = true
+
+			// ── Resize — anchor overlay to the right of the fixed panel ──────
+
+			win.OnResize(func(w, h int) {
+				currentW, currentH = w, h
+				if visible {
+					overlay.SetBounds(panelW, 0, w-panelW, h)
+				}
+        log.Printf("[go] window resized → %d × %d", w, h)
+			})
 
 			// ── IPC handlers ──────────────────────────────────────────────
 
@@ -94,6 +106,9 @@ func main() {
 					overlay.Hide()
 					log.Println("[go] overlay hidden")
 				} else {
+					// Snap to current window size before showing in case a
+					// resize occurred while the overlay was hidden.
+					overlay.SetBounds(panelW, 0, currentW-panelW, currentH)
 					overlay.Show()
 					log.Println("[go] overlay shown")
 				}

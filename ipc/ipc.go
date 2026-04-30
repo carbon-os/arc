@@ -1,75 +1,81 @@
+// Package ipc provides the IPC channel types shared by the arc SDK.
 package ipc
 
-import (
-	"log"
+import "sync"
 
-	"github.com/carbon-os/arc/internal/runtime"
-)
+// Config lets the caller skip automatic renderer spawning by providing a
+// pre-negotiated channel id.  Leave zero-value to let arc spawn arc-host.
+type Config struct {
+	Channel string
+}
 
-// Message is an inbound message from the renderer's JavaScript side.
+// Message is a message delivered from the JS context via arc.post().
 type Message struct {
 	text   string
 	data   []byte
 	binary bool
 }
 
-// IsText reports whether this message carries a UTF-8 string payload.
-func (m Message) IsText() bool { return !m.binary }
+// NewTextMessage wraps a text payload.  Called by arc internals.
+func NewTextMessage(text string) Message { return Message{text: text} }
 
-// IsBinary reports whether this message carries a raw byte payload.
+// NewBinaryMessage wraps a binary payload.  Called by arc internals.
+func NewBinaryMessage(data []byte) Message { return Message{data: data, binary: true} }
+
+func (m Message) Text() string   { return m.text }
+func (m Message) Bytes() []byte  { return m.data }
 func (m Message) IsBinary() bool { return m.binary }
 
-// Text returns the string payload. Empty if IsBinary is true.
-func (m Message) Text() string { return m.text }
+// Handle is an IPC endpoint scoped to one WebView's JS context.
+// All methods are safe to call from any goroutine.
+type Handle struct {
+	mu       sync.RWMutex
+	handlers map[string]func(Message)
 
-// Bytes returns the binary payload. Nil if IsText is true.
-func (m Message) Bytes() []byte { return m.data }
-
-// IPC is the messaging handle for a single BrowserWindow.
-// Obtain one via win.IPC() — do not construct directly.
-type IPC struct {
-	rt  *runtime.Runtime
-	log *log.Logger
+	sendText   func(channel, payload string)
+	sendBinary func(channel string, data []byte)
 }
 
-// New creates an IPC handle backed by the given runtime.
-// Called by BrowserWindow.IPC() — do not call directly.
-func New(rt *runtime.Runtime, logging bool) *IPC {
-	return &IPC{rt: rt, log: runtime.NewLogger(logging)}
+// NewHandle is called by arc internals when a WebView becomes ready.
+func NewHandle(
+	sendText func(channel, payload string),
+	sendBinary func(channel string, data []byte),
+) *Handle {
+	return &Handle{
+		handlers:   make(map[string]func(Message)),
+		sendText:   sendText,
+		sendBinary: sendBinary,
+	}
 }
 
-// On registers a handler for inbound messages on the named channel.
-// Replaces any previously registered handler for that channel.
-// Handlers are called on a dedicated goroutine.
-func (c *IPC) On(channel string, fn func(Message)) {
-	c.log.Printf("[go] ipc.On: registering channel=%q", channel)
-	c.rt.OnMessage(channel, func(text string, data []byte, binary bool) {
-		c.log.Printf("[go] ipc: handler fired channel=%q binary=%v", channel, binary)
-		if binary {
-			fn(Message{data: data, binary: true})
-		} else {
-			fn(Message{text: text})
-		}
-	})
+// On registers a handler for messages arriving on channel from JS.
+// Replaces any previous handler for the same channel.
+func (h *Handle) On(channel string, fn func(msg Message)) {
+	h.mu.Lock()
+	h.handlers[channel] = fn
+	h.mu.Unlock()
 }
 
-// Off removes the handler registered for the named channel.
-func (c *IPC) Off(channel string) {
-	c.rt.OffMessage(channel)
+// Off removes the handler for channel.
+func (h *Handle) Off(channel string) {
+	h.mu.Lock()
+	delete(h.handlers, channel)
+	h.mu.Unlock()
 }
 
-// Send delivers a UTF-8 string to the named channel in JavaScript.
-// Safe to call from any goroutine.
-func (c *IPC) Send(channel, text string) {
-	c.log.Printf("[go] ipc.Send: channel=%q text=%q", channel, text)
-	payload := append(runtime.EncodeStr(channel), runtime.EncodeStr(text)...)
-	c.rt.Send(runtime.CmdPostText, payload)
-}
+// Send sends a text message to the JS side on channel.
+func (h *Handle) Send(channel string, text string) { h.sendText(channel, text) }
 
-// SendBytes delivers a binary message to the named channel in JavaScript.
-// Safe to call from any goroutine.
-func (c *IPC) SendBytes(channel string, data []byte) {
-	c.log.Printf("[go] ipc.SendBytes: channel=%q bytes=%d", channel, len(data))
-	payload := append(runtime.EncodeStr(channel), data...)
-	c.rt.Send(runtime.CmdPostBinary, payload)
+// SendBytes sends a binary message to the JS side on channel.
+func (h *Handle) SendBytes(channel string, data []byte) { h.sendBinary(channel, data) }
+
+// Deliver routes an incoming message to the registered handler.
+// Called by arc internals from the reader goroutine — do not block.
+func (h *Handle) Deliver(channel string, msg Message) {
+	h.mu.RLock()
+	fn := h.handlers[channel]
+	h.mu.RUnlock()
+	if fn != nil {
+		fn(msg)
+	}
 }

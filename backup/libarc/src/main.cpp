@@ -122,6 +122,10 @@ int main(int argc, char** argv)
         channel.send_event(Event::Closed);
     });
 
+    wv.on_resize([&](int w, int h) {
+        channel.send_resized(w, h);
+    });
+
     wv.on_ipc_text([&](std::string_view ch, std::string_view text) {
         channel.send_ipc_text(ch, text);
     });

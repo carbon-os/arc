@@ -1,206 +1,198 @@
+// Package window provides window creation config and the Window handle.
 package window
 
 import (
 	"sync"
 
-	"github.com/carbon-os/arc/billing"
-	"github.com/carbon-os/arc/ipc"
-	"github.com/carbon-os/arc/internal/runtime"
 	"github.com/carbon-os/arc/webview"
 )
 
-// TitleBarStyle controls the appearance of the native window title bar.
-// Re-exported here so callers only need to import the window package.
-type TitleBarStyle = runtime.TitleBarStyle
+// Config holds window creation parameters.
+type Config struct {
+	Title  string
+	Width  int // default 1280
+	Height int // default 800
 
-const (
-	// TitleBarDefault shows the standard OS title bar.
-	TitleBarDefault TitleBarStyle = runtime.TitleBarDefault
+	MinWidth  int
+	MinHeight int
+	MaxWidth  int // 0 = unlimited
+	MaxHeight int // 0 = unlimited
 
-	// TitleBarHidden hides the title bar while keeping the window border,
-	// shadow, resize handles, and traffic lights (macOS).
-	TitleBarHidden TitleBarStyle = runtime.TitleBarHidden
+	Resizable   bool // default true
+	Center      bool // default true
+	Frameless   bool
+	Transparent bool
+	AlwaysOnTop bool
+
+	// macOS-specific
+	MacVibrancy      string // e.g. "sidebar", "hudWindow"
+	MacTitleBarStyle string // "default" | "hidden"
+
+	// Windows-specific
+	WinMica bool
+}
+
+type (
+	sendFn       = func(cmd any)
+	newWebViewFn = func(windowID string, cfg webview.Config) *webview.WebView
 )
 
-// RendererConfig is forwarded from AppConfig to each window's runtime.
-type RendererConfig struct {
-	Path      string
-	Prebuilt  bool
-	Logging   bool
-	ChannelID string
+// Window is a handle to a native application window.
+type Window struct {
+	mu sync.Mutex
+	id string
+
+	send       sendFn
+	newWebView newWebViewFn
+
+	// lazy root WebView for the convenience LoadHTML/LoadURL/LoadFile methods
+	rootOnce sync.Once
+	rootWV   *webview.WebView
+
+	// event callbacks
+	onReady  func()
+	onClose  func()
+	onResize func(width, height int)
+	onMove   func(x, y int)
+	onFocus  func()
+	onBlur   func()
 }
 
-// Config holds the options for a new BrowserWindow.
-type Config struct {
-	Title         string
-	Width         int
-	Height        int
-	Debug         bool
-	TitleBarStyle TitleBarStyle
+// New creates a Window.  Called by arc internals.
+func New(cfg Config, send sendFn, newWebView newWebViewFn) *Window {
+	return &Window{send: send, newWebView: newWebView}
 }
 
-// BrowserWindow is a handle to a native window and its dedicated renderer
-// process. Each BrowserWindow spawns and owns exactly one renderer process,
-// or connects to one pre-spawned by an external parent (e.g. main_process.mm).
-type BrowserWindow struct {
-	cfg     Config
-	rt      *runtime.Runtime
-	logging bool
-
-	ipcObj  *ipc.IPC
-	ipcOnce sync.Once
-
-	billingMu  sync.Mutex
-	billingObj *billing.Billing
-
-	mu      sync.Mutex
-	onReady func()
-	onClose func() bool
-}
-
-// New creates a BrowserWindow and prepares its runtime. The renderer process
-// is not spawned (or connected to) until Run is called — which App.NewBrowserWindow
-// does automatically in a goroutine.
-func New(cfg Config, rendererCfg RendererConfig) *BrowserWindow {
-	if cfg.Width == 0 {
-		cfg.Width = 1280
+// SetID is called by arc internals when the renderer assigns a window id.
+// It triggers the OnReady callback.
+func (w *Window) SetID(id string) {
+	w.mu.Lock()
+	w.id = id
+	fn := w.onReady
+	w.mu.Unlock()
+	if fn != nil {
+		fn()
 	}
-	if cfg.Height == 0 {
-		cfg.Height = 800
-	}
-
-	w := &BrowserWindow{cfg: cfg, logging: rendererCfg.Logging}
-
-	rt, _ := runtime.New(runtime.Config{
-		Title:         cfg.Title,
-		Width:         cfg.Width,
-		Height:        cfg.Height,
-		Debug:         cfg.Debug,
-		TitleBarStyle: cfg.TitleBarStyle,
-		RendererPath:  rendererCfg.Path,
-		Prebuilt:      rendererCfg.Prebuilt,
-		Logging:       rendererCfg.Logging,
-		ChannelID:     rendererCfg.ChannelID,
-		OnReady: func() {
-			w.mu.Lock()
-			cb := w.onReady
-			w.mu.Unlock()
-			if cb != nil {
-				cb()
-			}
-		},
-		OnClose: func() bool {
-			w.mu.Lock()
-			cb := w.onClose
-			w.mu.Unlock()
-			if cb != nil {
-				return cb()
-			}
-			return true
-		},
-	})
-
-	w.rt = rt
-	return w
 }
 
-// Run connects to or spawns the renderer and blocks until the window is closed.
-// Called automatically by App.NewBrowserWindow — do not call directly.
-func (w *BrowserWindow) Run() error {
-	return w.rt.Run()
-}
-
-// IPC returns the IPC handle for this window. Lazily initialised on first call.
-func (w *BrowserWindow) IPC() *ipc.IPC {
-	w.ipcOnce.Do(func() {
-		w.ipcObj = ipc.New(w.rt, w.logging)
-	})
-	return w.ipcObj
-}
-
-// NewWebView creates an embedded WebView attached to this window.
-// The web view is created hidden; call Show (or SetBounds then Show) to
-// make it visible. Must be called from within the OnReady callback.
-//
-// WebViews run in a fully isolated context and do not support IPC.
-func (w *BrowserWindow) NewWebView(cfg webview.Config) *webview.WebView {
-	return webview.New(w.rt, cfg)
-}
-
-// NewBilling creates and initialises the Billing handle for this window.
-// Must be called from within OnReady. Subsequent calls return the existing
-// handle unchanged.
-func (w *BrowserWindow) NewBilling(cfg billing.Config) (*billing.Billing, error) {
-	w.billingMu.Lock()
-	defer w.billingMu.Unlock()
-
-	if w.billingObj != nil {
-		return w.billingObj, nil
-	}
-
-	b, err := billing.New(w.rt, cfg, w.logging)
-	if err != nil {
-		return nil, err
-	}
-
-	w.billingObj = b
-	return b, nil
-}
-
-// OnReady registers a callback that fires once this window's renderer is
-// initialised and ready to receive commands.
-func (w *BrowserWindow) OnReady(fn func()) {
+func (w *Window) getID() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.onReady = fn
+	return w.id
 }
 
-// OnClose registers a callback that fires when the user tries to close this
-// window. Return true to allow the close, false to suppress it.
-func (w *BrowserWindow) OnClose(fn func() bool) {
+// ── Events ────────────────────────────────────────────────────────────────────
+
+// OnReady fires once the renderer has created the native window and its
+// underlying WebView is ready to receive commands.
+func (w *Window) OnReady(fn func()) { w.mu.Lock(); w.onReady = fn; w.mu.Unlock() }
+func (w *Window) OnClose(fn func()) { w.mu.Lock(); w.onClose = fn; w.mu.Unlock() }
+func (w *Window) OnResize(fn func(width, height int)) {
+	w.mu.Lock(); w.onResize = fn; w.mu.Unlock()
+}
+func (w *Window) OnMove(fn func(x, y int)) { w.mu.Lock(); w.onMove = fn; w.mu.Unlock() }
+func (w *Window) OnFocus(fn func())        { w.mu.Lock(); w.onFocus = fn; w.mu.Unlock() }
+func (w *Window) OnBlur(fn func())         { w.mu.Lock(); w.onBlur = fn; w.mu.Unlock() }
+
+// ── Content (convenience wrappers over an implicit root WebView) ──────────────
+
+// LoadHTML loads HTML into a lazily-created root WebView.
+// Must be called from within OnReady or after.
+func (w *Window) LoadHTML(html string) { w.rootWebView().LoadHTML(html) }
+
+// LoadURL loads a URL into a lazily-created root WebView.
+// Must be called from within OnReady or after.
+func (w *Window) LoadURL(url string) { w.rootWebView().LoadURL(url) }
+
+// LoadFile loads a local file into a lazily-created root WebView.
+// Must be called from within OnReady or after.
+func (w *Window) LoadFile(path string) { w.rootWebView().LoadFile(path) }
+
+func (w *Window) rootWebView() *webview.WebView {
+	w.rootOnce.Do(func() {
+		w.rootWV = w.newWebView(w.getID(), webview.Config{Layout: "root"})
+	})
+	return w.rootWV
+}
+
+// ── WebView management ────────────────────────────────────────────────────────
+
+// NewWebView creates an overlay WebView inside this window.
+// Must be called from within OnReady or after.
+func (w *Window) NewWebView(cfg webview.Config) *webview.WebView {
+	return w.newWebView(w.getID(), cfg)
+}
+
+// ── Window control ────────────────────────────────────────────────────────────
+
+func (w *Window) SetTitle(title string) {
+	w.send(map[string]any{"cmd": "window_set_title", "window_id": w.getID(), "title": title})
+}
+func (w *Window) SetSize(width, height int) {
+	w.send(map[string]any{"cmd": "window_set_size", "window_id": w.getID(), "width": width, "height": height})
+}
+func (w *Window) SetMinSize(width, height int) {
+	w.send(map[string]any{"cmd": "window_set_min_size", "window_id": w.getID(), "width": width, "height": height})
+}
+func (w *Window) SetMaxSize(width, height int) {
+	w.send(map[string]any{"cmd": "window_set_max_size", "window_id": w.getID(), "width": width, "height": height})
+}
+func (w *Window) Center() {
+	w.send(map[string]any{"cmd": "window_center", "window_id": w.getID()})
+}
+func (w *Window) SetFullscreen(on bool) {
+	w.send(map[string]any{"cmd": "window_fullscreen", "window_id": w.getID(), "enabled": on})
+}
+func (w *Window) Minimize() {
+	w.send(map[string]any{"cmd": "window_minimize", "window_id": w.getID()})
+}
+func (w *Window) Maximize() {
+	w.send(map[string]any{"cmd": "window_maximize", "window_id": w.getID()})
+}
+func (w *Window) Close() {
+	w.send(map[string]any{"cmd": "window_close", "window_id": w.getID()})
+}
+
+// ── DispatchEvent — called by arc internals ───────────────────────────────────
+
+// DispatchEvent routes an inbound window event to the appropriate handler.
+// Called from the reader goroutine — handlers must not block.
+func (w *Window) DispatchEvent(event string, j map[string]any) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.onClose = fn
+	onClose  := w.onClose
+	onResize := w.onResize
+	onMove   := w.onMove
+	onFocus  := w.onFocus
+	onBlur   := w.onBlur
+	w.mu.Unlock()
+
+	switch event {
+	case "window_closed":
+		if onClose != nil {
+			onClose()
+		}
+	case "window_resized":
+		if onResize != nil {
+			onResize(intField(j, "width"), intField(j, "height"))
+		}
+	case "window_moved":
+		if onMove != nil {
+			onMove(intField(j, "x"), intField(j, "y"))
+		}
+	case "window_focused":
+		if onFocus != nil {
+			onFocus()
+		}
+	case "window_unfocused":
+		if onBlur != nil {
+			onBlur()
+		}
+	}
 }
 
-// OnResize registers a callback that fires whenever the window is resized.
-// width and height are the new content area dimensions in pixels.
-// Safe to register before or after the window is ready.
-func (w *BrowserWindow) OnResize(fn func(width, height int)) {
-	w.rt.OnResize(fn)
-}
-
-// LoadFile navigates the window to a local HTML file.
-func (w *BrowserWindow) LoadFile(path string) {
-	w.rt.Send(runtime.CmdLoadFile, runtime.EncodeStr(path))
-}
-
-// LoadHTML loads a raw HTML string directly into the window.
-func (w *BrowserWindow) LoadHTML(html string) {
-	w.rt.Send(runtime.CmdLoadHTML, runtime.EncodeStr(html))
-}
-
-// LoadURL navigates the window to an external URL.
-func (w *BrowserWindow) LoadURL(url string) {
-	w.rt.Send(runtime.CmdLoadURL, runtime.EncodeStr(url))
-}
-
-// SetTitle updates the window title bar.
-func (w *BrowserWindow) SetTitle(title string) {
-	w.rt.Send(runtime.CmdSetTitle, runtime.EncodeStr(title))
-}
-
-// SetSize resizes the window to the given pixel dimensions.
-func (w *BrowserWindow) SetSize(width, height int) {
-	w.rt.Send(runtime.CmdSetSize, runtime.EncodeU32U32(uint32(width), uint32(height)))
-}
-
-// Eval executes a JavaScript expression in the window's current page.
-func (w *BrowserWindow) Eval(js string) {
-	w.rt.Send(runtime.CmdEval, runtime.EncodeStr(js))
-}
-
-// Quit programmatically closes this window.
-func (w *BrowserWindow) Quit() {
-	w.rt.Quit()
+func intField(j map[string]any, key string) int {
+	if f, ok := j[key].(float64); ok {
+		return int(f)
+	}
+	return 0
 }
