@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 )
 
 // Config holds the parameters used when starting a renderer process.
@@ -56,6 +57,8 @@ type Runtime struct {
 	billingProductsHandler BillingProductsHandler
 	billingPurchaseHandler BillingPurchaseHandler
 
+	nextWebViewID uint32 // atomically incremented; zero is reserved
+
 	quit chan struct{}
 	once sync.Once
 }
@@ -77,6 +80,12 @@ func New(cfg Config) (*Runtime, error) {
 		handlers: make(map[string]MessageHandler),
 		quit:     make(chan struct{}),
 	}, nil
+}
+
+// NextWebViewID returns a window-scoped ID for a new embedded web view.
+// IDs start at 1 and are unique within this Runtime for its lifetime.
+func (rt *Runtime) NextWebViewID() uint32 {
+	return atomic.AddUint32(&rt.nextWebViewID, 1)
 }
 
 // Run connects to or spawns the renderer process, then blocks on the event

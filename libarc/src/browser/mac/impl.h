@@ -25,10 +25,24 @@ struct OutboundFrame {
     std::vector<uint8_t> data;
 };
 
-struct WebViewImpl {
-    NSWindow* window  = nullptr;
+// ── Embedded web view ─────────────────────────────────────────────────────────
+//
+// Each EmbeddedWebView is a borderless NSPanel attached as a child window of
+// the main NSWindow. It runs in a fully isolated WKWebView context — separate
+// data store, no IPC shim injected.
+
+struct EmbeddedWebView {
+    NSPanel*   panel   = nullptr;
     WKWebView* webview = nullptr;
-    WebView* owner   = nullptr;
+    int        zorder  = 0;   // last known zorder; used when re-stacking
+};
+
+// ── Main window state ─────────────────────────────────────────────────────────
+
+struct WebViewImpl {
+    NSWindow*  window  = nullptr;
+    WKWebView* webview = nullptr;
+    WebView*   owner   = nullptr;
     id         window_delegate = nil;
 
     WebView::ReadyCallback      on_ready_cb;
@@ -51,6 +65,11 @@ struct WebViewImpl {
 
     std::mutex                cmd_mutex;
     std::queue<InboundFrame>  cmd_queue;
+
+    // Embedded web views — keyed by the Go-assigned uint32 ID.
+    // All access must be from the main thread (consistent with all other
+    // NSWindow/WKWebView operations).
+    std::unordered_map<uint32_t, EmbeddedWebView> embeds;
 };
 
 } // namespace browser

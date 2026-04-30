@@ -19,18 +19,18 @@
 // ── Title bar style ───────────────────────────────────────────────────────────
 
 enum class TitleBarStyle : uint8_t {
-    Default = 0,   // standard OS title bar
-    Hidden  = 1,   // hide title bar, keep border / shadow / traffic lights
+    Default = 0,
+    Hidden  = 1,
 };
 
 // ── Window config (sent as first frame from Go) ───────────────────────────────
 
 struct WindowConfig {
-    int            width          = 1280;
-    int            height         = 800;
-    bool           debug          = false;
+    int            width         = 1280;
+    int            height        = 800;
+    bool           debug         = false;
     std::string    title;
-    TitleBarStyle  titleBarStyle  = TitleBarStyle::Default;
+    TitleBarStyle  titleBarStyle = TitleBarStyle::Default;
 };
 
 // ── Command bytes (Go → renderer) ────────────────────────────────────────────
@@ -49,6 +49,19 @@ enum class Command : uint8_t {
     BillingInit    = 0x0B,
     BillingBuy     = 0x0C,
     BillingRestore = 0x0D,
+
+    // Embedded web view commands
+    WebViewCreate    = 0x10,
+    WebViewLoadURL   = 0x11,
+    WebViewLoadFile  = 0x12,
+    WebViewLoadHTML  = 0x13,
+    WebViewShow      = 0x14,
+    WebViewHide      = 0x15,
+    WebViewMove      = 0x16,
+    WebViewResize    = 0x17,
+    WebViewSetBounds = 0x18,
+    WebViewSetZOrder = 0x19,
+    WebViewDestroy   = 0x1A,
 };
 
 // ── Event bytes (renderer → Go) ──────────────────────────────────────────────
@@ -97,6 +110,7 @@ struct InboundFrame {
     WindowConfig wc;
 
     // LoadFile / LoadHTML / LoadURL / Eval / SetTitle / BillingBuy
+    // Also reused for WebViewLoad* content string
     std::string  str;
 
     // PostText / PostBinary
@@ -110,6 +124,14 @@ struct InboundFrame {
 
     // BillingInit
     std::vector<BillingProductDecl> billing_products;
+
+    // Embedded web view fields — populated for all WebView* commands
+    uint32_t wv_id     = 0;
+    int      wv_x      = 0;
+    int      wv_y      = 0;
+    int      wv_width  = 0;
+    int      wv_height = 0;
+    int      wv_zorder = 0;
 };
 
 // ── HostChannel ───────────────────────────────────────────────────────────────

@@ -6,6 +6,7 @@ import (
 	"github.com/carbon-os/arc/billing"
 	"github.com/carbon-os/arc/ipc"
 	"github.com/carbon-os/arc/internal/runtime"
+	"github.com/carbon-os/arc/webview"
 )
 
 // TitleBarStyle controls the appearance of the native window title bar.
@@ -115,6 +116,15 @@ func (w *BrowserWindow) IPC() *ipc.IPC {
 		w.ipcObj = ipc.New(w.rt, w.logging)
 	})
 	return w.ipcObj
+}
+
+// NewWebView creates an embedded WebView attached to this window.
+// The web view is created hidden; call Show (or SetBounds then Show) to
+// make it visible. Must be called from within the OnReady callback.
+//
+// WebViews run in a fully isolated context and do not support IPC.
+func (w *BrowserWindow) NewWebView(cfg webview.Config) *webview.WebView {
+	return webview.New(w.rt, cfg)
 }
 
 // NewBilling creates and initialises the Billing handle for this window.

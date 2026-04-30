@@ -16,6 +16,11 @@ static uint32_t le32_dec(const uint8_t* p)
          | ((uint32_t)p[3] << 24);
 }
 
+static int32_t le32_dec_signed(const uint8_t* p)
+{
+    return static_cast<int32_t>(le32_dec(p));
+}
+
 static void le32_enc(std::vector<uint8_t>& v, uint32_t n)
 {
     v.push_back((uint8_t)(n));
@@ -188,6 +193,10 @@ bool HostChannel::read_frame(InboundFrame& out)
         if (!need(4)) return 0;
         uint32_t v = le32_dec(p); p += 4; return v;
     };
+    auto read_i32 = [&]() -> int32_t {
+        if (!need(4)) return 0;
+        int32_t v = le32_dec_signed(p); p += 4; return v;
+    };
     auto read_str = [&]() -> std::string {
         uint32_t n = read_u32();
         if (!need(n)) return {};
@@ -227,6 +236,56 @@ bool HostChannel::read_frame(InboundFrame& out)
         break;
     case Command::Quit:
         break;
+
+    // ── Embedded web view commands ────────────────────────────────────────────
+
+    case Command::WebViewCreate:
+        out.wv_id     = read_u32();
+        out.wv_x      = read_i32();
+        out.wv_y      = read_i32();
+        out.wv_width  = static_cast<int>(read_u32());
+        out.wv_height = static_cast<int>(read_u32());
+        out.wv_zorder = read_i32();
+        break;
+
+    case Command::WebViewLoadURL:
+    case Command::WebViewLoadFile:
+    case Command::WebViewLoadHTML:
+        out.wv_id = read_u32();
+        out.str   = read_str();
+        break;
+
+    case Command::WebViewShow:
+    case Command::WebViewHide:
+    case Command::WebViewDestroy:
+        out.wv_id = read_u32();
+        break;
+
+    case Command::WebViewMove:
+        out.wv_id = read_u32();
+        out.wv_x  = read_i32();
+        out.wv_y  = read_i32();
+        break;
+
+    case Command::WebViewResize:
+        out.wv_id     = read_u32();
+        out.wv_width  = static_cast<int>(read_u32());
+        out.wv_height = static_cast<int>(read_u32());
+        break;
+
+    case Command::WebViewSetBounds:
+        out.wv_id     = read_u32();
+        out.wv_x      = read_i32();
+        out.wv_y      = read_i32();
+        out.wv_width  = static_cast<int>(read_u32());
+        out.wv_height = static_cast<int>(read_u32());
+        break;
+
+    case Command::WebViewSetZOrder:
+        out.wv_id     = read_u32();
+        out.wv_zorder = read_i32();
+        break;
+
     default:
         logger::Warn("HostChannel: unknown command byte 0x%02X",
                      static_cast<uint8_t>(out.type));
@@ -267,5 +326,35 @@ void HostChannel::send_ipc_binary(std::string_view channel,
     payload.push_back(static_cast<uint8_t>(Event::IpcBinary));
     append_str(payload, channel);
     payload.insert(payload.end(), data.begin(), data.end());
+    enqueue(make_frame(payload));
+}
+
+void HostChannel::send_billing_products(const std::vector<BillingProductInfo>& products)
+{
+    logger::Info("HostChannel: send_billing_products count=%zu", products.size());
+    std::vector<uint8_t> payload;
+    payload.push_back(static_cast<uint8_t>(Event::BillingProducts));
+    le32_enc(payload, static_cast<uint32_t>(products.size()));
+    for (const auto& p : products) {
+        append_str(payload, p.id);
+        append_str(payload, p.title);
+        append_str(payload, p.description);
+        append_str(payload, p.formatted_price);
+        payload.push_back(p.kind);
+    }
+    enqueue(make_frame(payload));
+}
+
+void HostChannel::send_billing_purchase(PurchaseStatus status,
+                                         std::string_view product_id,
+                                         std::string_view error_msg)
+{
+    logger::Info("HostChannel: send_billing_purchase product=%.*s status=%d",
+                 (int)product_id.size(), product_id.data(), (int)status);
+    std::vector<uint8_t> payload;
+    payload.push_back(static_cast<uint8_t>(Event::BillingPurchase));
+    payload.push_back(static_cast<uint8_t>(status));
+    append_str(payload, product_id);
+    append_str(payload, error_msg);
     enqueue(make_frame(payload));
 }

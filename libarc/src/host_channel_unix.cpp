@@ -17,6 +17,12 @@ static uint32_t le32_dec(const uint8_t* p)
          | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+// Decode a uint32 on the wire as a signed int32 (two's complement passthrough).
+static int32_t le32_dec_signed(const uint8_t* p)
+{
+    return static_cast<int32_t>(le32_dec(p));
+}
+
 static void le32_enc(std::vector<uint8_t>& v, uint32_t n)
 {
     v.push_back((uint8_t)(n));
@@ -159,12 +165,16 @@ bool HostChannel::read_frame(InboundFrame& out)
     out      = {};
     out.type = static_cast<Command>(*p++);
 
-    auto need     = [&](uint32_t n) { return (p + n) <= end; };
-    auto read_u32 = [&]() -> uint32_t {
+    auto need         = [&](uint32_t n) { return (p + n) <= end; };
+    auto read_u32     = [&]() -> uint32_t {
         if (!need(4)) return 0;
         uint32_t v = le32_dec(p); p += 4; return v;
     };
-    auto read_str = [&]() -> std::string {
+    auto read_i32     = [&]() -> int32_t {
+        if (!need(4)) return 0;
+        int32_t v = le32_dec_signed(p); p += 4; return v;
+    };
+    auto read_str     = [&]() -> std::string {
         uint32_t n = read_u32();
         if (!need(n)) return {};
         std::string s(reinterpret_cast<const char*>(p), n);
@@ -217,6 +227,63 @@ bool HostChannel::read_frame(InboundFrame& out)
     case Command::BillingRestore:
     case Command::Quit:
         break;
+
+    // ── Embedded web view commands ────────────────────────────────────────────
+
+    case Command::WebViewCreate:
+        // id:u32  x:i32  y:i32  width:u32  height:u32  zorder:i32
+        out.wv_id     = read_u32();
+        out.wv_x      = read_i32();
+        out.wv_y      = read_i32();
+        out.wv_width  = static_cast<int>(read_u32());
+        out.wv_height = static_cast<int>(read_u32());
+        out.wv_zorder = read_i32();
+        break;
+
+    case Command::WebViewLoadURL:
+    case Command::WebViewLoadFile:
+    case Command::WebViewLoadHTML:
+        // id:u32  content:str
+        out.wv_id = read_u32();
+        out.str   = read_str();
+        break;
+
+    case Command::WebViewShow:
+    case Command::WebViewHide:
+    case Command::WebViewDestroy:
+        // id:u32
+        out.wv_id = read_u32();
+        break;
+
+    case Command::WebViewMove:
+        // id:u32  x:i32  y:i32
+        out.wv_id = read_u32();
+        out.wv_x  = read_i32();
+        out.wv_y  = read_i32();
+        break;
+
+    case Command::WebViewResize:
+        // id:u32  width:u32  height:u32
+        out.wv_id     = read_u32();
+        out.wv_width  = static_cast<int>(read_u32());
+        out.wv_height = static_cast<int>(read_u32());
+        break;
+
+    case Command::WebViewSetBounds:
+        // id:u32  x:i32  y:i32  width:u32  height:u32
+        out.wv_id     = read_u32();
+        out.wv_x      = read_i32();
+        out.wv_y      = read_i32();
+        out.wv_width  = static_cast<int>(read_u32());
+        out.wv_height = static_cast<int>(read_u32());
+        break;
+
+    case Command::WebViewSetZOrder:
+        // id:u32  zorder:i32
+        out.wv_id     = read_u32();
+        out.wv_zorder = read_i32();
+        break;
+
     default:
         logger::Warn("HostChannel: unknown command 0x%02X",
                      static_cast<uint8_t>(out.type));

@@ -1,267 +1,148 @@
 #include "impl.h"
 #include "scheme.h"
-#include "wstring.h"
 #include "shim.h"
 #include "logger.h"
 
-#include <WebView2EnvironmentOptions.h>
-#include <wrl/client.h>
-#include <wrl/event.h>
-#include <dwmapi.h>
+#import <Cocoa/Cocoa.h>
+#import <WebKit/WebKit.h>
 
-#include <cstdio>
-#include <sstream>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
-using Microsoft::WRL::Callback;
-using Microsoft::WRL::ComPtr;
+// ── Window delegate ───────────────────────────────────────────────────────────
+
+@interface ArcWindowDelegate : NSObject <NSWindowDelegate>
+@property (assign) browser::WebViewImpl* impl;
+@end
+
+@implementation ArcWindowDelegate
+
+- (void)windowWillClose:(NSNotification*)notification
+{
+    logger::Info("WebView: windowWillClose");
+    if (self.impl->on_closed_cb)
+        self.impl->on_closed_cb();
+}
+
+@end
+
+// ── WebView ───────────────────────────────────────────────────────────────────
 
 namespace browser {
 
-LRESULT CALLBACK wnd_proc(HWND, UINT, WPARAM, LPARAM);
-
-static constexpr UINT kMsgFlush   = WM_APP + 1;
-static constexpr UINT kMsgCommand = WM_APP + 2;
-
 WebView::WebView(const WindowConfig& cfg) : impl_(new WebViewImpl())
 {
-    impl_->owner         = this;
-    impl_->titlebar_style = cfg.titleBarStyle;
+    impl_->owner = this;
 
-    HRESULT hr_com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    if (FAILED(hr_com) && hr_com != S_FALSE && hr_com != RPC_E_CHANGED_MODE)
-        throw std::runtime_error("browser::WebView: CoInitializeEx failed");
+    [NSApplication sharedApplication];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
-    static bool registered = false;
-    if (!registered) {
-        WNDCLASSEXW wc{};
-        wc.cbSize        = sizeof(wc);
-        wc.lpfnWndProc   = wnd_proc;
-        wc.hInstance     = GetModuleHandleW(nullptr);
-        wc.lpszClassName = L"arc_renderer";
-        wc.hCursor       = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
-        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-        RegisterClassExW(&wc);
-        registered = true;
-        logger::Info("WebView: window class registered");
+    // ── WKWebViewConfiguration ────────────────────────────────────────────────
+
+    WKWebViewConfiguration* config = [[WKWebViewConfiguration alloc] init];
+
+    ArcSchemeHandler* handler = [[ArcSchemeHandler alloc] init];
+    handler.impl = impl_;
+    [config setURLSchemeHandler:handler forURLScheme:@"ui-ipc"];
+
+    NSString*     shimSrc    = [NSString stringWithUTF8String:browser::mac::k_shim];
+    WKUserScript* shimScript = [[WKUserScript alloc]
+                                    initWithSource:shimSrc
+                                     injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                  forMainFrameOnly:NO];
+    [config.userContentController addUserScript:shimScript];
+    logger::Info("WebView: IPC shim injected");
+
+    if (cfg.debug) {
+        [config.preferences setValue:@YES forKey:@"developerExtrasEnabled"];
+        logger::Info("WebView: DevTools enabled");
     }
 
-    // ── Window style ──────────────────────────────────────────────────────────
-    //
-    // Default: WS_OVERLAPPEDWINDOW — standard title bar + border.
-    //
-    // Hidden:  WS_THICKFRAME + WS_SYSMENU + WS_MINIMIZEBOX + WS_MAXIMIZEBOX
-    //          No WS_CAPTION — removes the title bar chrome.
-    //          WS_THICKFRAME keeps the DWM shadow and resize border.
-    //          WM_NCCALCSIZE in wnd_proc removes the residual 1px top line.
+    // ── WKWebView ─────────────────────────────────────────────────────────────
+
+    NSRect frame   = NSMakeRect(0, 0, cfg.width, cfg.height);
+    impl_->webview = [[WKWebView alloc] initWithFrame:frame configuration:config];
+
+    // ── NSWindow ──────────────────────────────────────────────────────────────
 
     const bool hidden_bar = (cfg.titleBarStyle == TitleBarStyle::Hidden);
 
-    DWORD style = hidden_bar
-        ? (WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
-        : WS_OVERLAPPEDWINDOW;
+    NSWindowStyleMask style = NSWindowStyleMaskTitled
+                            | NSWindowStyleMaskClosable
+                            | NSWindowStyleMaskResizable
+                            | NSWindowStyleMaskMiniaturizable;
 
-    impl_->hwnd = CreateWindowExW(
-        0, L"arc_renderer",
-        win::to_wide(cfg.title).c_str(),
-        style,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        cfg.width, cfg.height,
-        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (hidden_bar)
+        style |= NSWindowStyleMaskFullSizeContentView;
 
-    if (!impl_->hwnd)
-        throw std::runtime_error("browser::WebView: CreateWindowEx failed");
+    impl_->window = [[NSWindow alloc]
+                         initWithContentRect:frame
+                                   styleMask:style
+                                     backing:NSBackingStoreBuffered
+                                       defer:NO];
 
-    SetWindowLongPtrW(impl_->hwnd, GWLP_USERDATA,
-                      reinterpret_cast<LONG_PTR>(impl_));
-
-    // Extend the DWM frame so the shadow is preserved on the hidden-bar path.
-    // A 0-margin call on the default path is a no-op.
     if (hidden_bar) {
-        MARGINS margins{ 0, 0, 1, 0 }; // 1px top lets DWM keep its shadow
-        DwmExtendFrameIntoClientArea(impl_->hwnd, &margins);
-        logger::Info("WebView: titleBarStyle=Hidden — DWM frame extended");
+        impl_->window.titleVisibility           = NSWindowTitleHidden;
+        impl_->window.titlebarAppearsTransparent = YES;
+        logger::Info("WebView: titleBarStyle=Hidden");
     }
 
-    ShowWindow(impl_->hwnd, SW_SHOW);
-    UpdateWindow(impl_->hwnd);
+    [impl_->window setTitle:[NSString stringWithUTF8String:cfg.title.c_str()]];
+    [impl_->window setContentView:impl_->webview];
+    [impl_->window center];
+
+    ArcWindowDelegate* delegate = [[ArcWindowDelegate alloc] init];
+    delegate.impl               = impl_;
+    impl_->window_delegate      = delegate;
+    [impl_->window setDelegate:delegate];
+
+    [impl_->window makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
 
     logger::Info("WebView: window created %dx%d title=%s titleBarStyle=%d",
                  cfg.width, cfg.height, cfg.title.c_str(),
                  static_cast<int>(cfg.titleBarStyle));
 
-    auto opts = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
-
-    ComPtr<ICoreWebView2EnvironmentOptions4> opts4;
-    if (SUCCEEDED(opts->QueryInterface(IID_PPV_ARGS(&opts4)))) {
-        auto reg = Microsoft::WRL::Make<CoreWebView2CustomSchemeRegistration>(L"ui-ipc");
-        reg->put_TreatAsSecure(TRUE);
-        reg->put_HasAuthorityComponent(TRUE);
-        LPCWSTR origins[] = { L"ui-ipc://app" };
-        reg->SetAllowedOrigins(1, origins);
-        ICoreWebView2CustomSchemeRegistration* regs[] = { reg.Get() };
-        opts4->SetCustomSchemeRegistrations(1, regs);
-        logger::Info("WebView: custom scheme ui-ipc registered");
-    }
-
-    HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
-        nullptr, nullptr, opts.Get(),
-        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-        [this, debug = cfg.debug](HRESULT res, ICoreWebView2Environment* env) -> HRESULT
-        {
-            if (FAILED(res) || !env) {
-                char msg[128];
-                std::snprintf(msg, sizeof(msg),
-                    "browser::WebView: environment creation failed (0x%08lX)", res);
-                logger::Error("WebView: environment creation failed 0x%08lX", res);
-                throw std::runtime_error(msg);
-            }
-
-            impl_->env = env;
-            logger::Info("WebView: environment created");
-
-            return env->CreateCoreWebView2Controller(impl_->hwnd,
-                Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                [this, debug](HRESULT res2, ICoreWebView2Controller* ctrl) -> HRESULT
-                {
-                    if (FAILED(res2) || !ctrl) {
-                        logger::Error("WebView: controller creation failed 0x%08lX", res2);
-                        return res2;
-                    }
-
-                    impl_->controller = ctrl;
-                    ctrl->get_CoreWebView2(&impl_->webview);
-                    logger::Info("WebView: controller created");
-
-                    RECT rc;
-                    GetClientRect(impl_->hwnd, &rc);
-                    ctrl->put_Bounds(rc);
-
-                    if (debug) {
-                        ComPtr<ICoreWebView2Settings> s;
-                        impl_->webview->get_Settings(&s);
-                        s->put_AreDevToolsEnabled(TRUE);
-                        logger::Info("WebView: DevTools enabled");
-                    }
-
-                    impl_->webview->AddScriptToExecuteOnDocumentCreated(
-                        win::to_wide(win::k_shim).c_str(), nullptr);
-                    logger::Info("WebView: IPC shim injected");
-
-                    impl_->webview->AddWebResourceRequestedFilter(
-                        L"ui-ipc://*/*",
-                        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
-
-                    impl_->webview->add_WebResourceRequested(
-                        Callback<ICoreWebView2WebResourceRequestedEventHandler>(
-                        [this](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
-                            return handle_resource_request(impl_, args);
-                        }).Get(),
-                        &impl_->resource_token);
-
-                    impl_->webview->add_WebMessageReceived(
-                        Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                        [this](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT
-                        {
-                            LPWSTR raw = nullptr;
-                            args->get_WebMessageAsJson(&raw);
-                            if (!raw) return S_OK;
-                            std::string json = win::to_utf8(raw);
-                            CoTaskMemFree(raw);
-
-                            auto get_str = [&](const std::string& key) -> std::string {
-                                std::string search = "\"" + key + "\":\"";
-                                auto pos = json.find(search);
-                                if (pos == std::string::npos) return {};
-                                pos += search.size();
-                                auto end = json.find('"', pos);
-                                if (end == std::string::npos) return {};
-                                std::string out;
-                                for (auto i = pos; i < end; ++i) {
-                                    if (json[i] == '\\' && i + 1 < end && json[i+1] == '"') {
-                                        out += '"'; ++i;
-                                    } else {
-                                        out += json[i];
-                                    }
-                                }
-                                return out;
-                            };
-
-                            std::string type    = get_str("type");
-                            std::string channel = get_str("channel");
-
-                            if (type == "ipc_text") {
-                                std::string text = get_str("text");
-                                logger::Info("WebView: ipc_text channel=%s", channel.c_str());
-                                if (impl_->on_ipc_text_cb)
-                                    impl_->on_ipc_text_cb(channel, text);
-
-                            } else if (type == "ipc_binary") {
-                                auto pos = json.find("\"data\":[");
-                                std::vector<uint8_t> bytes;
-                                if (pos != std::string::npos) {
-                                    pos += 8;
-                                    auto end = json.find(']', pos);
-                                    if (end != std::string::npos) {
-                                        std::stringstream ss(json.substr(pos, end - pos));
-                                        std::string tok;
-                                        while (std::getline(ss, tok, ',')) {
-                                            try { bytes.push_back((uint8_t)std::stoi(tok)); }
-                                            catch (...) {}
-                                        }
-                                    }
-                                }
-                                logger::Info("WebView: ipc_binary channel=%s bytes=%zu",
-                                             channel.c_str(), bytes.size());
-                                if (impl_->on_ipc_binary_cb)
-                                    impl_->on_ipc_binary_cb(channel, bytes);
-                            } else {
-                                logger::Warn("WebView: unknown postMessage type=%s", type.c_str());
-                            }
-
-                            return S_OK;
-                        }).Get(),
-                        &impl_->message_token);
-
-                    logger::Info("WebView: firing on_ready");
-                    if (impl_->on_ready_cb)
-                        impl_->on_ready_cb();
-
-                    return S_OK;
-                }).Get());
-        }).Get());
-
-    if (FAILED(hr))
-        throw std::runtime_error("browser::WebView: CreateCoreWebView2EnvironmentWithOptions failed");
+    WebViewImpl* impl = impl_;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        logger::Info("WebView: firing on_ready");
+        if (impl->on_ready_cb)
+            impl->on_ready_cb();
+    });
 }
 
 WebView::~WebView() { delete impl_; }
-
-void WebView::eval(std::string_view js)
-{
-    logger::Info("WebView: eval %zu chars", js.size());
-    impl_->webview->ExecuteScript(win::to_wide(js).c_str(), nullptr);
-}
 
 void WebView::on_ready(ReadyCallback cb)          { impl_->on_ready_cb      = std::move(cb); }
 void WebView::on_closed(ClosedCallback cb)        { impl_->on_closed_cb     = std::move(cb); }
 void WebView::on_ipc_text(IpcTextCallback cb)     { impl_->on_ipc_text_cb   = std::move(cb); }
 void WebView::on_ipc_binary(IpcBinaryCallback cb) { impl_->on_ipc_binary_cb = std::move(cb); }
 
+void WebView::eval(std::string_view js)
+{
+    logger::Info("WebView: eval %zu chars", js.size());
+    NSString* script = [NSString stringWithUTF8String:std::string(js).c_str()];
+    [impl_->webview evaluateJavaScript:script completionHandler:nil];
+}
+
 void WebView::dispatch(InboundFrame frame)
 {
     logger::Info("WebView: dispatch cmd=0x%02X", static_cast<uint8_t>(frame.type));
     {
-        std::lock_guard<std::mutex> lock(impl_->cmd_mutex);
+        std::lock_guard lock(impl_->cmd_mutex);
         impl_->cmd_queue.push(std::move(frame));
     }
-    PostMessageW(impl_->hwnd, kMsgCommand, 0, 0);
+    WebView* self = this;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self->drain_cmd_queue();
+    });
 }
 
 void WebView::drain_cmd_queue()
 {
-    std::unique_lock<std::mutex> lock(impl_->cmd_mutex);
+    std::unique_lock lock(impl_->cmd_mutex);
     while (!impl_->cmd_queue.empty()) {
         InboundFrame f = std::move(impl_->cmd_queue.front());
         impl_->cmd_queue.pop();
@@ -274,6 +155,7 @@ void WebView::drain_cmd_queue()
 void WebView::execute_frame(const InboundFrame& f)
 {
     switch (f.type) {
+    // ── Main window ───────────────────────────────────────────────────────────
     case Command::LoadFile:   load_file(f.str);               break;
     case Command::LoadHTML:   load_html(f.str);               break;
     case Command::LoadURL:    load_url(f.str);                break;
@@ -282,11 +164,277 @@ void WebView::execute_frame(const InboundFrame& f)
     case Command::SetSize:    set_size(f.width, f.height);    break;
     case Command::PostText:   post_text(f.channel, f.text);   break;
     case Command::PostBinary: post_binary(f.channel, f.data); break;
+
+    // ── Embedded web views ────────────────────────────────────────────────────
+    case Command::WebViewCreate:
+        embed_create(f.wv_id, f.wv_x, f.wv_y, f.wv_width, f.wv_height, f.wv_zorder);
+        break;
+    case Command::WebViewLoadURL:
+        embed_load_url(f.wv_id, f.str);
+        break;
+    case Command::WebViewLoadFile:
+        embed_load_file(f.wv_id, f.str);
+        break;
+    case Command::WebViewLoadHTML:
+        embed_load_html(f.wv_id, f.str);
+        break;
+    case Command::WebViewShow:
+        embed_show(f.wv_id);
+        break;
+    case Command::WebViewHide:
+        embed_hide(f.wv_id);
+        break;
+    case Command::WebViewMove:
+        embed_move(f.wv_id, f.wv_x, f.wv_y);
+        break;
+    case Command::WebViewResize:
+        embed_resize(f.wv_id, f.wv_width, f.wv_height);
+        break;
+    case Command::WebViewSetBounds:
+        embed_set_bounds(f.wv_id, f.wv_x, f.wv_y, f.wv_width, f.wv_height);
+        break;
+    case Command::WebViewSetZOrder:
+        embed_set_zorder(f.wv_id, f.wv_zorder);
+        break;
+    case Command::WebViewDestroy:
+        embed_destroy(f.wv_id);
+        break;
+
     default:
         logger::Warn("WebView: execute_frame unknown cmd=0x%02X",
                      static_cast<uint8_t>(f.type));
         break;
     }
+}
+
+// ── Coordinate conversion ─────────────────────────────────────────────────────
+//
+// Go coordinates: origin at main window top-left, Y increases downward.
+// macOS NSRect:   origin at screen bottom-left, Y increases upward.
+//
+// We use the outer window frame (including title bar) as the reference so
+// that x=0, y=0 places the panel flush against the top-left corner of the
+// window chrome — matching the documented API contract.
+
+NSRect WebView::embed_screen_rect(int x, int y, int width, int height) const
+{
+    NSRect wf = impl_->window.frame;
+    CGFloat sx = wf.origin.x + static_cast<CGFloat>(x);
+    CGFloat sy = wf.origin.y + wf.size.height
+                 - static_cast<CGFloat>(y)
+                 - static_cast<CGFloat>(height);
+    return NSMakeRect(sx, sy, static_cast<CGFloat>(width), static_cast<CGFloat>(height));
+}
+
+// ── Z-order ───────────────────────────────────────────────────────────────────
+//
+// Re-order all child panels by ascending zorder. We detach all panels, sort
+// them, then re-add them in order so each successive addChildWindow places it
+// above the previous one.
+
+void WebView::embed_restack()
+{
+    if (impl_->embeds.empty()) return;
+
+    // Collect live panels sorted by zorder ascending.
+    std::vector<std::pair<int, NSPanel*>> sorted;
+    sorted.reserve(impl_->embeds.size());
+    for (auto& [id, ev] : impl_->embeds) {
+        if (ev.panel) sorted.push_back({ ev.zorder, ev.panel });
+    }
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b){ return a.first < b.first; });
+
+    // Detach all, then re-add in ascending order so the last (highest zorder)
+    // ends up on top.
+    for (auto& [z, panel] : sorted)
+        [impl_->window removeChildWindow:panel];
+    for (auto& [z, panel] : sorted)
+        [impl_->window addChildWindow:panel ordered:NSWindowAbove];
+
+    logger::Info("WebView: embed_restack — %zu panel(s) restacked", sorted.size());
+}
+
+// ── Embedded web view operations ──────────────────────────────────────────────
+
+void WebView::embed_create(uint32_t id, int x, int y, int width, int height, int zorder)
+{
+    if (impl_->embeds.count(id)) {
+        logger::Warn("WebView: embed_create — id %u already exists, ignoring", id);
+        return;
+    }
+
+    logger::Info("WebView: embed_create id=%u x=%d y=%d w=%d h=%d z=%d",
+                 id, x, y, width, height, zorder);
+
+    // ── Isolated WKWebView configuration — no IPC shim ───────────────────────
+
+    WKWebViewConfiguration* cfg = [[WKWebViewConfiguration alloc] init];
+    cfg.websiteDataStore = [WKWebsiteDataStore nonPersistentDataStore];
+    // Deliberately no scheme handler and no user script — embedded views
+    // have no IPC access.
+
+    NSRect bounds = NSMakeRect(0, 0,
+                               static_cast<CGFloat>(width),
+                               static_cast<CGFloat>(height));
+    WKWebView* wv = [[WKWebView alloc] initWithFrame:bounds configuration:cfg];
+    wv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+    // ── Borderless, non-activating NSPanel ────────────────────────────────────
+
+    NSPanel* panel = [[NSPanel alloc]
+                          initWithContentRect:embed_screen_rect(x, y, width, height)
+                                    styleMask:NSWindowStyleMaskBorderless
+                                              | NSWindowStyleMaskNonactivatingPanel
+                                      backing:NSBackingStoreBuffered
+                                        defer:NO];
+
+    panel.releasedWhenClosed    = NO;
+    panel.opaque                = YES;
+    panel.hasShadow             = NO;
+    panel.contentView           = wv;
+
+    // Hidden until Show() is called — matches the Go API contract.
+    [panel orderOut:nil];
+
+    // Attach to main window so it moves and minimises together.
+    [impl_->window addChildWindow:panel ordered:NSWindowAbove];
+
+    EmbeddedWebView ev;
+    ev.panel   = panel;
+    ev.webview = wv;
+    ev.zorder  = zorder;
+    impl_->embeds[id] = ev;
+
+    // Re-sort all panels so the new one lands at the right z-depth.
+    embed_restack();
+}
+
+void WebView::embed_load_url(uint32_t id, std::string_view url)
+{
+    auto it = impl_->embeds.find(id);
+    if (it == impl_->embeds.end()) {
+        logger::Warn("WebView: embed_load_url — unknown id %u", id); return;
+    }
+    logger::Info("WebView: embed_load_url id=%u url=%.*s",
+                 id, (int)url.size(), url.data());
+    NSURL*        nsurl = [NSURL URLWithString:[NSString stringWithUTF8String:std::string(url).c_str()]];
+    NSURLRequest* req   = [NSURLRequest requestWithURL:nsurl];
+    [it->second.webview loadRequest:req];
+}
+
+void WebView::embed_load_file(uint32_t id, std::string_view path)
+{
+    auto it = impl_->embeds.find(id);
+    if (it == impl_->embeds.end()) {
+        logger::Warn("WebView: embed_load_file — unknown id %u", id); return;
+    }
+    logger::Info("WebView: embed_load_file id=%u path=%.*s",
+                 id, (int)path.size(), path.data());
+    namespace fs = std::filesystem;
+    fs::path   p    = fs::absolute(fs::path(path).lexically_normal());
+    NSURL*     base = [NSURL fileURLWithPath:[NSString stringWithUTF8String:
+                                                  p.parent_path().string().c_str()]
+                                 isDirectory:YES];
+    NSURL*     file = [NSURL fileURLWithPath:[NSString stringWithUTF8String:p.string().c_str()]];
+    [it->second.webview loadFileURL:file allowingReadAccessToURL:base];
+}
+
+void WebView::embed_load_html(uint32_t id, std::string_view html)
+{
+    auto it = impl_->embeds.find(id);
+    if (it == impl_->embeds.end()) {
+        logger::Warn("WebView: embed_load_html — unknown id %u", id); return;
+    }
+    logger::Info("WebView: embed_load_html id=%u %zu chars", id, html.size());
+    NSString* src = [NSString stringWithUTF8String:std::string(html).c_str()];
+    [it->second.webview loadHTMLString:src baseURL:nil];
+}
+
+void WebView::embed_show(uint32_t id)
+{
+    auto it = impl_->embeds.find(id);
+    if (it == impl_->embeds.end()) {
+        logger::Warn("WebView: embed_show — unknown id %u", id); return;
+    }
+    logger::Info("WebView: embed_show id=%u", id);
+    [it->second.panel orderFront:nil];
+}
+
+void WebView::embed_hide(uint32_t id)
+{
+    auto it = impl_->embeds.find(id);
+    if (it == impl_->embeds.end()) {
+        logger::Warn("WebView: embed_hide — unknown id %u", id); return;
+    }
+    logger::Info("WebView: embed_hide id=%u", id);
+    [it->second.panel orderOut:nil];
+}
+
+void WebView::embed_move(uint32_t id, int x, int y)
+{
+    auto it = impl_->embeds.find(id);
+    if (it == impl_->embeds.end()) {
+        logger::Warn("WebView: embed_move — unknown id %u", id); return;
+    }
+    logger::Info("WebView: embed_move id=%u x=%d y=%d", id, x, y);
+    NSRect cur = it->second.panel.frame;
+    NSRect nr  = embed_screen_rect(x, y,
+                                   static_cast<int>(cur.size.width),
+                                   static_cast<int>(cur.size.height));
+    [it->second.panel setFrameOrigin:nr.origin];
+}
+
+void WebView::embed_resize(uint32_t id, int width, int height)
+{
+    auto it = impl_->embeds.find(id);
+    if (it == impl_->embeds.end()) {
+        logger::Warn("WebView: embed_resize — unknown id %u", id); return;
+    }
+    logger::Info("WebView: embed_resize id=%u w=%d h=%d", id, width, height);
+    // Derive the Go-relative position from the current screen frame, then
+    // rebuild with the new size so the top-left corner stays fixed.
+    NSRect wf  = impl_->window.frame;
+    NSRect cur = it->second.panel.frame;
+    int    gx  = static_cast<int>(cur.origin.x - wf.origin.x);
+    int    gy  = static_cast<int>(wf.origin.y + wf.size.height
+                                  - cur.origin.y - cur.size.height);
+    [it->second.panel setFrame:embed_screen_rect(gx, gy, width, height) display:YES];
+}
+
+void WebView::embed_set_bounds(uint32_t id, int x, int y, int width, int height)
+{
+    auto it = impl_->embeds.find(id);
+    if (it == impl_->embeds.end()) {
+        logger::Warn("WebView: embed_set_bounds — unknown id %u", id); return;
+    }
+    logger::Info("WebView: embed_set_bounds id=%u x=%d y=%d w=%d h=%d",
+                 id, x, y, width, height);
+    [it->second.panel setFrame:embed_screen_rect(x, y, width, height) display:YES];
+}
+
+void WebView::embed_set_zorder(uint32_t id, int zorder)
+{
+    auto it = impl_->embeds.find(id);
+    if (it == impl_->embeds.end()) {
+        logger::Warn("WebView: embed_set_zorder — unknown id %u", id); return;
+    }
+    logger::Info("WebView: embed_set_zorder id=%u z=%d", id, zorder);
+    it->second.zorder = zorder;
+    embed_restack();
+}
+
+void WebView::embed_destroy(uint32_t id)
+{
+    auto it = impl_->embeds.find(id);
+    if (it == impl_->embeds.end()) {
+        logger::Warn("WebView: embed_destroy — unknown id %u", id); return;
+    }
+    logger::Info("WebView: embed_destroy id=%u", id);
+    NSPanel* panel = it->second.panel;
+    [impl_->window removeChildWindow:panel];
+    [panel orderOut:nil];
+    impl_->embeds.erase(it);
 }
 
 } // namespace browser

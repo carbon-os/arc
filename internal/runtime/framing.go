@@ -24,6 +24,19 @@ const (
 	CmdBillingInit    CmdByte = 0x0B
 	CmdBillingBuy     CmdByte = 0x0C
 	CmdBillingRestore CmdByte = 0x0D
+
+	// Embedded web view commands
+	CmdWebViewCreate    CmdByte = 0x10
+	CmdWebViewLoadURL   CmdByte = 0x11
+	CmdWebViewLoadFile  CmdByte = 0x12
+	CmdWebViewLoadHTML  CmdByte = 0x13
+	CmdWebViewShow      CmdByte = 0x14
+	CmdWebViewHide      CmdByte = 0x15
+	CmdWebViewMove      CmdByte = 0x16
+	CmdWebViewResize    CmdByte = 0x17
+	CmdWebViewSetBounds CmdByte = 0x18
+	CmdWebViewSetZOrder CmdByte = 0x19
+	CmdWebViewDestroy   CmdByte = 0x1A
 )
 
 type evtByte = uint8
@@ -121,6 +134,72 @@ func EncodeBillingInit(products []BillingProductDecl) []byte {
 	return buf
 }
 
+// ── Web view payload builders ─────────────────────────────────────────────────
+
+// EncodeWebViewCreate builds the WebViewCreate payload.
+//
+//	id:u32  x:i32  y:i32  width:u32  height:u32  zorder:i32
+func EncodeWebViewCreate(id uint32, x, y, width, height, zorder int) []byte {
+	b := make([]byte, 24)
+	binary.LittleEndian.PutUint32(b[0:], id)
+	binary.LittleEndian.PutUint32(b[4:], uint32(int32(x)))
+	binary.LittleEndian.PutUint32(b[8:], uint32(int32(y)))
+	binary.LittleEndian.PutUint32(b[12:], uint32(width))
+	binary.LittleEndian.PutUint32(b[16:], uint32(height))
+	binary.LittleEndian.PutUint32(b[20:], uint32(int32(zorder)))
+	return b
+}
+
+// EncodeWebViewID encodes a bare web view ID — used for Show, Hide, Destroy.
+func EncodeWebViewID(id uint32) []byte {
+	b := make([]byte, 4)
+	binary.LittleEndian.PutUint32(b, id)
+	return b
+}
+
+// EncodeWebViewLoad encodes a web view ID followed by a string — used for
+// LoadURL, LoadFile, and LoadHTML.
+func EncodeWebViewLoad(id uint32, s string) []byte {
+	return append(EncodeWebViewID(id), EncodeStr(s)...)
+}
+
+// EncodeWebViewMove encodes id + x + y.
+func EncodeWebViewMove(id uint32, x, y int) []byte {
+	b := make([]byte, 12)
+	binary.LittleEndian.PutUint32(b[0:], id)
+	binary.LittleEndian.PutUint32(b[4:], uint32(int32(x)))
+	binary.LittleEndian.PutUint32(b[8:], uint32(int32(y)))
+	return b
+}
+
+// EncodeWebViewResize encodes id + width + height.
+func EncodeWebViewResize(id uint32, width, height int) []byte {
+	b := make([]byte, 12)
+	binary.LittleEndian.PutUint32(b[0:], id)
+	binary.LittleEndian.PutUint32(b[4:], uint32(width))
+	binary.LittleEndian.PutUint32(b[8:], uint32(height))
+	return b
+}
+
+// EncodeWebViewSetBounds encodes id + x + y + width + height atomically.
+func EncodeWebViewSetBounds(id uint32, x, y, width, height int) []byte {
+	b := make([]byte, 20)
+	binary.LittleEndian.PutUint32(b[0:], id)
+	binary.LittleEndian.PutUint32(b[4:], uint32(int32(x)))
+	binary.LittleEndian.PutUint32(b[8:], uint32(int32(y)))
+	binary.LittleEndian.PutUint32(b[12:], uint32(width))
+	binary.LittleEndian.PutUint32(b[16:], uint32(height))
+	return b
+}
+
+// EncodeWebViewSetZOrder encodes id + zorder.
+func EncodeWebViewSetZOrder(id uint32, zorder int) []byte {
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint32(b[0:], id)
+	binary.LittleEndian.PutUint32(b[4:], uint32(int32(zorder)))
+	return b
+}
+
 // ── Frame I/O ─────────────────────────────────────────────────────────────────
 
 // WriteFrame writes a length-prefixed frame to w:
@@ -147,10 +226,10 @@ func WriteFrame(w io.Writer, typ CmdByte, payload []byte) error {
 
 // Event is a decoded inbound frame from the renderer.
 type Event struct {
-	Type    evtByte
-	Channel string
-	Text    string
-	Data    []byte
+	Type            evtByte
+	Channel         string
+	Text            string
+	Data            []byte
 	BillingProducts []BillingProduct
 	BillingPurchase BillingPurchaseEvent
 }
