@@ -4,6 +4,8 @@ package arc
 
 import "net"
 
-func dialRenderer(path string) (net.Conn, error) {
-	return net.Dial("unix", path)
+// dialHost connects to arc-host via a Unix domain socket.
+// arc-host binds the socket at /tmp/arc-ipc-<channelID> before accepting.
+func dialHost(channelID string) (net.Conn, error) {
+	return net.Dial("unix", "/tmp/arc-ipc-"+channelID)
 }

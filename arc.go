@@ -1,425 +1,471 @@
+// Package arc is the Go controller for the Arc native UI runtime (arc-host).
+//
+// arc-host owns the platform event loop, windows, views, and WebViews.
+// This package is the controller: it connects to arc-host over libipc,
+// issues commands (create windows, load content, …), and receives events
+// back (resize, close, JS IPC messages, …).
+//
+// # Deployment modes
+//
+// Managed — Go spawns arc-host itself:
+//
+//	app := arc.NewApp(arc.AppConfig{
+//	    Renderer: arc.RendererConfig{Path: "/path/to/arc-host"},
+//	})
+//
+// External — arc-host is already running (useful for testing):
+//
+//	app := arc.NewApp(arc.AppConfig{
+//	    Ipc: ipc.Config{Channel: "my-channel-id"},
+//	})
+//
+// # Typical usage
+//
+//	app.OnReady(func() {
+//	    win := app.NewBrowserWindow(window.Config{Title: "My App", Width: 1280, Height: 800})
+//	    win.OnReady(func() {
+//	        win.LoadHTML(myHTML)
+//	    })
+//	})
+//	app.OnClose(func() bool { return true })
+//	if err := app.Run(); err != nil {
+//	    log.Fatal(err)
+//	}
 package arc
 
 import (
-	"bufio"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"runtime"
-	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
-	"github.com/carbon-os/arc/ipc"
-	"github.com/carbon-os/arc/webview"
-	"github.com/carbon-os/arc/window"
+	arcIpc "github.com/carbon-os/arc/ipc"
+	wcfg "github.com/carbon-os/arc/window"
 )
 
-// HostConfig controls how the arc-host process is located or connected to.
-type HostConfig struct {
-	// Path is the absolute (or relative) path to the arc-host binary.
-	// Default: looks for arc-host next to the running executable.
-	Path string
+// ─── Configuration ────────────────────────────────────────────────────────────
 
-	// Channel is a pre-negotiated channel id. When non-empty, arc will NOT
-	// spawn arc-host — it will connect to the already-running instance at
-	// the socket / named-pipe derived from this id.
-	// Useful for tests or when arc-host is managed externally.
-	Channel string
+// RendererConfig tells the App how to locate and launch the arc-host binary.
+type RendererConfig struct {
+	// Path is the filesystem path to the arc-host executable.
+	Path string
 }
 
-// AppConfig configures the application.
+// AppConfig holds top-level application parameters.
 type AppConfig struct {
-	// Human-readable name shown as the default window title.
+	// Title is the application name forwarded to arc-host in host.configure.
 	Title string
 
-	// Emit verbose logs from arc-host and the SDK. Default false.
+	// Logging enables verbose debug logging to stderr.
 	Logging bool
 
-	// Host controls arc-host binary location and connection.
-	// Leave zero-value for automatic discovery next to the executable.
-	Host HostConfig
+	// Renderer causes Run to spawn arc-host from the given path.
+	// Leave zero-value if arc-host is managed externally.
+	Renderer RendererConfig
+
+	// Ipc allows connecting to an already-running arc-host instance by
+	// specifying its channel ID.  Takes effect when Renderer.Path is empty.
+	Ipc arcIpc.Config
 }
 
-// NewApp constructs an App. No host process is spawned yet.
-func NewApp(cfg AppConfig) *App {
-	return &App{
-		cfg:     cfg,
-		windows: make(map[string]*window.Window),
-		views:   make(map[string]*webview.WebView),
-		done:    make(chan struct{}),
-	}
-}
+// ─── App ──────────────────────────────────────────────────────────────────────
 
-// App is the top-level application handle.
+// App is the root object that manages the connection to arc-host.
+// Create with NewApp, register callbacks, then call Run.
 type App struct {
 	cfg AppConfig
 
-	conn    net.Conn
-	writeMu sync.Mutex
-
-	pendingMu sync.Mutex
-	pending   []pendingEntry
-
-	winMu   sync.RWMutex
-	windows map[string]*window.Window
-
-	viewMu sync.RWMutex
-	views  map[string]*webview.WebView
+	conn   net.Conn   // set during Run; not accessed after readLoop exits
+	sendMu sync.Mutex // serialises concurrent writes to conn
 
 	onReady func()
-	onClose func() // bool removed: "closed" fires after NSApp has already exited, nothing to veto
+	onClose func() bool
 
-	done chan struct{}
+	// Entity maps — protected by mu.
+	mu         sync.RWMutex
+	windows    map[string]*Window  // window ID  → Window
+	webviewOwn map[string]*Window  // webview ID → owning Window (primary wv only)
+	overlayOwn map[string]*WebView // overlay ID → WebView
+
+	hostCmd   *exec.Cmd
+	channelID string
+	done      chan struct{}
+	idSeq     uint64 // accessed via sync/atomic
 }
 
-type pendingEntry struct {
-	event   string
-	resolve func(id string)
+// NewApp creates a new App from cfg. Register callbacks before calling Run.
+func NewApp(cfg AppConfig) *App {
+	return &App{
+		cfg:        cfg,
+		windows:    make(map[string]*Window),
+		webviewOwn: make(map[string]*Window),
+		overlayOwn: make(map[string]*WebView),
+		done:       make(chan struct{}),
+	}
 }
 
-func (a *App) OnReady(fn func())      { a.onReady = fn }
-func (a *App) OnClose(fn func())      { a.onClose = fn }
+// OnReady registers fn to be called after arc-host has connected and confirmed
+// configuration. Create windows and WebViews here.
+func (a *App) OnReady(fn func()) { a.onReady = fn }
 
-func (a *App) NewWindow(cfg window.Config) *window.Window {
-	win := window.New(cfg, a.sendJSON, a.newWebViewFn)
+// OnClose registers fn to be called when arc-host disconnects (e.g. after the
+// last window is closed or Shutdown is called). Return true to allow the
+// process to exit normally.
+func (a *App) OnClose(fn func() bool) { a.onClose = fn }
 
-	// NOTE: pending entries are consumed FIFO per event type.
-	// window_ready entries must be resolved in the same order the host emits them,
-	// which matches the order window_create commands were sent — safe as long as
-	// commands are written serially (they are, via writeMu).
-	a.pendingMu.Lock()
-	a.pending = append(a.pending, pendingEntry{
-		event: "window_ready",
-		resolve: func(id string) {
-			win.SetID(id)
-			a.winMu.Lock()
-			a.windows[id] = win
-			a.winMu.Unlock()
-		},
-	})
-	a.pendingMu.Unlock()
-
-	a.sendJSON(windowCreateCmd(cfg))
-	return win
+// Shutdown sends a graceful shutdown command to arc-host.
+// Run will return shortly after.
+func (a *App) Shutdown() {
+	a.sendJSON(map[string]any{"type": "host.shutdown"})
 }
 
-func (a *App) newWebViewFn(windowID string, cfg webview.Config) *webview.WebView {
-	view := webview.New(cfg, a.sendJSON, a.sendBinaryMsg)
-
-	// Same FIFO ordering assumption as NewWindow above.
-	a.pendingMu.Lock()
-	a.pending = append(a.pending, pendingEntry{
-		event: "view_ready",
-		resolve: func(id string) {
-			view.SetID(id)
-			a.viewMu.Lock()
-			a.views[id] = view
-			a.viewMu.Unlock()
-		},
-	})
-	a.pendingMu.Unlock()
-
-	a.sendJSON(viewCreateCmd(windowID, cfg))
-	return view
-}
-
+// Run connects to (or spawns) arc-host and enters the event loop.
+// It blocks until arc-host disconnects and returns any fatal error.
+//
+// Run must be called from the main goroutine (or at minimum only once).
 func (a *App) Run() error {
-	conn, err := a.connect()
-	if err != nil {
-		return err
+	// ── Determine channel ID ──────────────────────────────────────────────────
+	a.channelID = a.cfg.Ipc.Channel
+	if a.channelID == "" {
+		a.channelID = fmt.Sprintf("arc-%d-%d", os.Getpid(), time.Now().UnixNano())
+	}
+
+	// ── Spawn arc-host if a renderer path is configured ───────────────────────
+	if a.cfg.Renderer.Path != "" {
+		cmd := exec.Command(a.cfg.Renderer.Path, "--ipc-channel", a.channelID)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("arc: start renderer: %w", err)
+		}
+		a.hostCmd = cmd
+		if a.cfg.Logging {
+			log.Printf("[arc] spawned arc-host pid=%d channel=%s", cmd.Process.Pid, a.channelID)
+		}
+	}
+
+	// ── Connect — retry for up to 10 s to allow arc-host time to bind ─────────
+	var conn net.Conn
+	var lastErr error
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, lastErr = dialHost(a.channelID)
+		if lastErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("arc: connect to host (channel %q): %w", a.channelID, lastErr)
 	}
 	a.conn = conn
-	defer conn.Close()
+	if a.cfg.Logging {
+		log.Printf("[arc] connected  channel=%s", a.channelID)
+	}
 
-	a.readLoop()
+	// ── Start read loop ───────────────────────────────────────────────────────
+	go a.readLoop()
+
+	// ── Block until arc-host disconnects ──────────────────────────────────────
+	<-a.done
+
+	if a.hostCmd != nil {
+		_ = a.hostCmd.Wait()
+	}
 	return nil
 }
 
-func (a *App) Quit() {
-	a.sendJSON(map[string]any{"cmd": "quit"})
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+// genID returns a unique ID string with prefix.
+func (a *App) genID(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, atomic.AddUint64(&a.idSeq, 1))
 }
 
-// ── Connection ────────────────────────────────────────────────────────────────
-
-func (a *App) connect() (net.Conn, error) {
-	// Pre-negotiated channel — connect directly, no spawn.
-	if a.cfg.Host.Channel != "" {
-		return dialRenderer(channelToPath(a.cfg.Host.Channel))
+// sendJSON marshals v and writes it as a JSON frame. Errors are logged.
+func (a *App) sendJSON(v any) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("[arc] marshal: %v", err)
+		return
 	}
-
-	// Locate arc-host binary.
-	hostPath := a.cfg.Host.Path
-	if hostPath == "" {
-		exe, err := os.Executable()
-		if err != nil {
-			return nil, fmt.Errorf("arc: locate executable: %w", err)
-		}
-		hostPath = filepath.Join(filepath.Dir(exe), "arc-host")
-		if runtime.GOOS == "windows" {
-			hostPath += ".exe"
-		}
-	}
-
-	var args []string
 	if a.cfg.Logging {
-		args = append(args, "--logging")
+		log.Printf("[arc] → %s", clip(string(data), 200))
 	}
-
-	cmd := exec.Command(hostPath, args...)
-	cmd.Stderr = os.Stderr
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("arc: stdout pipe: %w", err)
+	if err := writeFrame(a.conn, &a.sendMu, msgTypeJSON, data); err != nil && a.cfg.Logging {
+		log.Printf("[arc] send: %v", err)
 	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("arc: spawn arc-host (%s): %w", hostPath, err)
-	}
-
-	// arc-host writes the socket path to stdout before blocking on accept().
-	scanner := bufio.NewScanner(stdout)
-	if !scanner.Scan() {
-		_ = cmd.Process.Kill()
-		return nil, fmt.Errorf("arc: arc-host did not write socket path to stdout")
-	}
-	socketPath := strings.TrimSpace(scanner.Text())
-
-	// Drain the rest of stdout so arc-host never blocks on a full pipe.
-	go io.Copy(io.Discard, stdout)
-
-	conn, err := dialRenderer(socketPath)
-	if err != nil {
-		_ = cmd.Process.Kill()
-		return nil, fmt.Errorf("arc: connect to arc-host at %s: %w", socketPath, err)
-	}
-	return conn, nil
 }
 
-func channelToPath(id string) string {
-	if runtime.GOOS == "windows" {
-		return `\\.\pipe\arc-` + id
-	}
-	tmp := os.Getenv("TMPDIR")
-	if tmp == "" {
-		tmp = "/tmp"
-	}
-	return tmp + "/arc-" + id + ".sock"
-}
-
-// ── Event reader ──────────────────────────────────────────────────────────────
+// ─── Read / event loop ────────────────────────────────────────────────────────
 
 func (a *App) readLoop() {
-	defer close(a.done)
+	defer func() {
+		_ = a.conn.Close()
+		if a.onClose != nil {
+			a.onClose()
+		}
+		close(a.done)
+	}()
+
 	for {
-		typ, payload, err := a.readFrame()
+		f, err := readFrame(a.conn)
 		if err != nil {
+			if a.cfg.Logging {
+				log.Printf("[arc] disconnected: %v", err)
+			}
 			return
 		}
-		if typ == 0x01 {
-			if stop := a.dispatchJSON(payload); stop {
-				return
-			}
-		}
+		a.handleFrame(f)
 	}
 }
 
-func (a *App) dispatchJSON(payload []byte) (stop bool) {
-	var j map[string]any
-	if err := json.Unmarshal(payload, &j); err != nil {
-		return false
+func (a *App) handleFrame(f frame) {
+	switch f.msgType {
+	case msgTypeJSON:
+		a.handleJSON(f.payload)
+	case msgTypeBinary:
+		// Binary frames are not used at the app level in the current protocol.
+		// WebView binary IPC is mediated through JSON webview.ipc events.
 	}
-	event, _ := j["event"].(string)
+}
 
-	switch event {
-	case "ready":
+// envelope is the minimal set of fields needed to route an inbound event.
+type envelope struct {
+	Type    string          `json:"type"`
+	ID      string          `json:"id"`
+	Channel string          `json:"channel"`
+	Body    json.RawMessage `json:"body"`
+	Width   int             `json:"width"`
+	Height  int             `json:"height"`
+	X       int             `json:"x"`
+	Y       int             `json:"y"`
+	State   string          `json:"state"`
+	URL     string          `json:"url"`
+	Title   string          `json:"title"`
+	Level   string          `json:"level"`
+	Text    string          `json:"text"`
+}
+
+func (a *App) handleJSON(payload []byte) {
+	var ev envelope
+	if err := json.Unmarshal(payload, &ev); err != nil {
+		return
+	}
+	if a.cfg.Logging {
+		log.Printf("[arc] ← %-30s id=%q", ev.Type, ev.ID)
+	}
+
+	switch ev.Type {
+
+	// ── Host lifecycle ────────────────────────────────────────────────────────
+
+	case "host.ready":
+		a.sendJSON(map[string]any{
+			"type":     "host.configure",
+			"app_name": a.cfg.Title,
+		})
+
+	case "host.configured":
 		if a.onReady != nil {
 			a.onReady()
 		}
 
-	case "closed":
-		// Fired after NSApp has already exited — inform the caller, then stop.
-		if a.onClose != nil {
-			a.onClose()
-		}
-		return true
+	case "host.pong": // response to a Ping — no action needed
 
-	case "window_ready":
-		wid, _ := j["window_id"].(string)
-		if fn := a.popPending("window_ready"); fn != nil {
-			fn(wid)
-		}
+	// ── Window events (ev.ID = window ID) ────────────────────────────────────
 
-	case "window_closed":
-		wid, _ := j["window_id"].(string)
-		a.winMu.RLock()
-		win := a.windows[wid]
-		a.winMu.RUnlock()
-		if win != nil {
-			win.DispatchEvent(event, j)
-		}
-		a.winMu.Lock()
-		delete(a.windows, wid)
-		a.winMu.Unlock()
-
-	case "window_resized", "window_moved", "window_focused", "window_unfocused":
-		wid, _ := j["window_id"].(string)
-		a.winMu.RLock()
-		win := a.windows[wid]
-		a.winMu.RUnlock()
-		if win != nil {
-			win.DispatchEvent(event, j)
-		}
-
-	case "view_ready":
-		vid, _ := j["view_id"].(string)
-		if fn := a.popPending("view_ready"); fn != nil {
-			fn(vid)
-		}
-
-	// ipc_text is listed explicitly so it doesn't fall through to the generic
-	// view-event default branch (which would also work today, but is fragile).
-	case "ipc_text":
-		vid, _ := j["view_id"].(string)
-		a.viewMu.RLock()
-		view := a.views[vid]
-		a.viewMu.RUnlock()
-		if view != nil {
-			view.DispatchEvent(event, j, nil)
-		}
-
-	case "ipc_binary":
-		_, binPayload, err := a.readFrame()
-		if err != nil {
-			return true
-		}
-		vid, _ := j["view_id"].(string)
-		a.viewMu.RLock()
-		view := a.views[vid]
-		a.viewMu.RUnlock()
-		if view != nil {
-			view.DispatchEvent(event, j, binPayload)
-		}
-
-	default:
-		// All remaining events that carry a view_id are routed to the WebView.
-		if vid, ok := j["view_id"].(string); ok && vid != "" {
-			a.viewMu.RLock()
-			view := a.views[vid]
-			a.viewMu.RUnlock()
-			if view != nil {
-				view.DispatchEvent(event, j, nil)
+	case "window.resized":
+		if w := a.win(ev.ID); w != nil {
+			w.mu.RLock()
+			fn := w.onResize
+			w.mu.RUnlock()
+			if fn != nil {
+				fn(ev.Width, ev.Height)
 			}
 		}
-	}
-	return false
-}
 
-func (a *App) popPending(event string) func(id string) {
-	a.pendingMu.Lock()
-	defer a.pendingMu.Unlock()
-	for i, p := range a.pending {
-		if p.event == event {
-			a.pending = append(a.pending[:i], a.pending[i+1:]...)
-			return p.resolve
+	case "window.moved":
+		if w := a.win(ev.ID); w != nil {
+			w.mu.RLock()
+			fn := w.onMove
+			w.mu.RUnlock()
+			if fn != nil {
+				fn(ev.X, ev.Y)
+			}
+		}
+
+	case "window.focused":
+		if w := a.win(ev.ID); w != nil {
+			w.mu.RLock()
+			fn := w.onFocus
+			w.mu.RUnlock()
+			if fn != nil {
+				fn()
+			}
+		}
+
+	case "window.blurred":
+		if w := a.win(ev.ID); w != nil {
+			w.mu.RLock()
+			fn := w.onBlur
+			w.mu.RUnlock()
+			if fn != nil {
+				fn()
+			}
+		}
+
+	case "window.closed":
+		if w := a.win(ev.ID); w != nil {
+			w.mu.RLock()
+			fn := w.onClose
+			w.mu.RUnlock()
+			if fn != nil {
+				fn()
+			}
+		}
+
+	case "window.state_changed":
+		if w := a.win(ev.ID); w != nil {
+			w.mu.RLock()
+			fn := w.onStateChange
+			w.mu.RUnlock()
+			if fn != nil {
+				fn(ev.State)
+			}
+		}
+
+	// ── WebView events (ev.ID = webview or overlay ID) ────────────────────────
+
+	case "webview.ready":
+		if w := a.wvWin(ev.ID); w != nil {
+			w.fireReady()
+		} else if ov := a.ovl(ev.ID); ov != nil {
+			ov.fireReady()
+		}
+
+	case "webview.ipc":
+		msg := arcIpc.NewMessage(ev.Body)
+		if w := a.wvWin(ev.ID); w != nil {
+			w.ipcBridge.dispatch(ev.Channel, msg)
+		} else if ov := a.ovl(ev.ID); ov != nil {
+			ov.ipcBridge.dispatch(ev.Channel, msg)
+		}
+
+	case "webview.navigate":
+		if w := a.wvWin(ev.ID); w != nil {
+			w.mu.RLock()
+			fn := w.onNavigate
+			w.mu.RUnlock()
+			if fn != nil {
+				fn(ev.URL)
+			}
+		}
+
+	case "webview.title":
+		if w := a.wvWin(ev.ID); w != nil {
+			w.mu.RLock()
+			fn := w.onTitleChange
+			w.mu.RUnlock()
+			if fn != nil {
+				fn(ev.Title)
+			}
+		}
+
+	case "webview.console":
+		if a.cfg.Logging {
+			log.Printf("[arc:console wv=%s] [%s] %s", ev.ID, ev.Level, ev.Text)
 		}
 	}
-	return nil
 }
 
-// ── Frame I/O ─────────────────────────────────────────────────────────────────
+// ── Entity lookups ────────────────────────────────────────────────────────────
 
-func (a *App) readFrame() (typ byte, payload []byte, err error) {
-	var hdr [5]byte
-	if _, err = io.ReadFull(a.conn, hdr[:]); err != nil {
-		return
-	}
-	typ = hdr[0]
-	n := binary.LittleEndian.Uint32(hdr[1:])
-	if n > 0 {
-		payload = make([]byte, n)
-		_, err = io.ReadFull(a.conn, payload)
-	}
-	return
+func (a *App) win(id string) *Window {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.windows[id]
 }
 
-func (a *App) sendJSON(v any) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return
-	}
-	a.writeFrame(0x01, b)
+func (a *App) wvWin(webviewID string) *Window {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.webviewOwn[webviewID]
 }
 
-func (a *App) sendBinaryMsg(jsonCmd any, data []byte) {
-	b, err := json.Marshal(jsonCmd)
-	if err != nil {
-		return
-	}
-	a.writeMu.Lock()
-	defer a.writeMu.Unlock()
-	a.writeFrameLocked(0x01, b)
-	a.writeFrameLocked(0x02, data)
+func (a *App) ovl(id string) *WebView {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.overlayOwn[id]
 }
 
-func (a *App) writeFrame(typ byte, payload []byte) {
-	a.writeMu.Lock()
-	defer a.writeMu.Unlock()
-	a.writeFrameLocked(typ, payload)
+// ─── Window factory ───────────────────────────────────────────────────────────
+
+// NewWindow creates a native window with an embedded window-backed WebView.
+// Call inside the App.OnReady callback.
+// Use win.OnReady to know when the WebView is initialised and ready for content.
+func (a *App) NewWindow(cfg wcfg.Config) *Window {
+	return a.newWindow(cfg)
 }
 
-func (a *App) writeFrameLocked(typ byte, payload []byte) {
-	if a.conn == nil {
-		return
-	}
-	var hdr [5]byte
-	hdr[0] = typ
-	binary.LittleEndian.PutUint32(hdr[1:], uint32(len(payload)))
-	_, _ = a.conn.Write(hdr[:])
-	if len(payload) > 0 {
-		_, _ = a.conn.Write(payload)
-	}
+// NewBrowserWindow is a semantic alias for NewWindow, intended for windows
+// whose primary purpose is to host a navigable web surface.
+func (a *App) NewBrowserWindow(cfg wcfg.Config) *Window {
+	return a.newWindow(cfg)
 }
 
-// ── Command builders ──────────────────────────────────────────────────────────
+func (a *App) newWindow(cfg wcfg.Config) *Window {
+	winID := a.genID("win")
+	wvID := a.genID("wv")
 
-func windowCreateCmd(cfg window.Config) map[string]any {
-	cmd := map[string]any{
-		"cmd": "window_create", "title": cfg.Title,
-		"width": cfg.Width, "height": cfg.Height,
-		"min_width": cfg.MinWidth, "min_height": cfg.MinHeight,
-		"max_width": cfg.MaxWidth, "max_height": cfg.MaxHeight,
-		"resizable": cfg.Resizable, "center": cfg.Center,
-		"frameless": cfg.Frameless, "transparent": cfg.Transparent,
-		"always_on_top": cfg.AlwaysOnTop,
+	w, h := cfg.Width, cfg.Height
+	if w == 0 {
+		w = 800
 	}
-	if cfg.Width == 0  { cmd["width"] = 1280 }
-	if cfg.Height == 0 { cmd["height"] = 800 }
-	if cfg.MacVibrancy != "" || cfg.MacTitleBarStyle != "" || cfg.WinMica {
-		plat := map[string]any{}
-		if cfg.MacVibrancy != "" || cfg.MacTitleBarStyle != "" {
-			mac := map[string]any{}
-			if cfg.MacVibrancy != ""      { mac["vibrancy"] = cfg.MacVibrancy }
-			if cfg.MacTitleBarStyle != "" { mac["title_bar_style"] = cfg.MacTitleBarStyle }
-			plat["mac"] = mac
-		}
-		if cfg.WinMica { plat["win"] = map[string]any{"mica": true} }
-		cmd["platform"] = plat
+	if h == 0 {
+		h = 600
 	}
-	return cmd
+
+	win := &Window{app: a, id: winID, webviewID: wvID}
+	win.ipcBridge = newBridgeForWindow(win)
+
+	a.mu.Lock()
+	a.windows[winID] = win
+	a.webviewOwn[wvID] = win
+	a.mu.Unlock()
+
+	a.sendJSON(map[string]any{
+		"type":      "window.create",
+		"id":        winID,
+		"title":     cfg.Title,
+		"width":     w,
+		"height":    h,
+		"resizable": !cfg.NoResize,
+		"style":     "default",
+	})
+
+	a.sendJSON(map[string]any{
+		"type":      "webview.create",
+		"id":        wvID,
+		"window_id": winID,
+		"mode":      "window",
+		"devtools":  cfg.Debug,
+	})
+
+	return win
 }
 
-func viewCreateCmd(windowID string, cfg webview.Config) map[string]any {
-	return map[string]any{
-		"cmd": "view_create", "window_id": windowID, "view_type": "webview",
-		"layout": cfg.Layout, "x": cfg.X, "y": cfg.Y,
-		"width": cfg.Width, "height": cfg.Height, "z": cfg.ZOrder,
-	}
-}
+// ── Utilities ─────────────────────────────────────────────────────────────────
 
-// keep ipc imported (used by callers via re-export of ipc.Handle)
-var _ = ipc.NewHandle
+// clip truncates s to at most n bytes, appending "…" if trimmed.
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
