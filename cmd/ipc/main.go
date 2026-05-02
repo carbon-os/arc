@@ -12,8 +12,8 @@ func main() {
 	app := arc.NewApp(arc.AppConfig{
 		Title:   "Arc IPC",
 		Logging: true,
-		Ipc: ipc.Config{
-			Channel: "arc-ipc-test",
+		Renderer: arc.RendererConfig{
+			Path: "/Users/galaxy/Desktop/libarc/build/arc-host/arc-host",
 		},
 	})
 
@@ -22,6 +22,7 @@ func main() {
 			Title:  "Arc IPC",
 			Width:  900,
 			Height: 640,
+			Debug:  true,
 		})
 
 		ipcMain := win.IPC()
@@ -143,6 +144,7 @@ const testHTML = `<!DOCTYPE html>
 
   <script>
     const logEl = document.getElementById('log')
+
     function appendLog(msg, cls) {
       const line = document.createElement('div')
       line.className = cls || ''
@@ -156,6 +158,7 @@ const testHTML = `<!DOCTYPE html>
       el.className = 'status ' + cls
       el.textContent = label
     }
+
     function setDetail(id, text) {
       document.getElementById(id).textContent = text
     }
@@ -182,7 +185,7 @@ const testHTML = `<!DOCTYPE html>
 
       try {
         const replyP = waitForReply('text-pong')
-        ipc.post('text-ping', payload)
+        ipc.send('text-ping', payload)
         const reply = await replyP
 
         const expected = 'go-echo:' + payload
@@ -206,26 +209,27 @@ const testHTML = `<!DOCTYPE html>
       setStatus('bin-status', '', 'running…')
       setDetail('bin-detail', '')
 
-      const sent = new Uint8Array([1, 2, 3, 4, 5])
-      const expected = new Uint8Array([5, 4, 3, 2, 1])
-      appendLog('→ binary-ping: [' + Array.from(sent) + ']', 'log-send')
+      const sent     = [1, 2, 3, 4, 5]
+      const expected = [5, 4, 3, 2, 1]
+      appendLog('→ binary-ping: [' + sent + ']', 'log-send')
 
       try {
         const replyP = waitForReply('binary-pong')
-        ipc.post('binary-ping', sent.buffer)
+        ipc.send('binary-ping', sent)
         const reply = await replyP
 
-        const got = new Uint8Array(reply)
+        // Go sends back via SendBytes → JSON uint8 array
+        const got = Array.isArray(reply) ? reply : Array.from(new Uint8Array(reply))
         const match = got.length === expected.length &&
           got.every((v, i) => v === expected[i])
 
         if (match) {
           setStatus('bin-status', 'pass', 'PASS')
-          setDetail('bin-detail', 'received: [' + Array.from(got) + ']')
-          appendLog('← binary-pong: [' + Array.from(got) + ']', 'log-recv')
+          setDetail('bin-detail', 'received: [' + got + ']')
+          appendLog('← binary-pong: [' + got + ']', 'log-recv')
         } else {
           setStatus('bin-status', 'fail', 'FAIL')
-          setDetail('bin-detail', 'got: [' + Array.from(got) + ']  want: [' + Array.from(expected) + ']')
+          setDetail('bin-detail', 'got: [' + got + ']  want: [' + expected + ']')
           appendLog('✗ binary mismatch', 'log-err')
         }
       } catch (e) {
