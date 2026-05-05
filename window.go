@@ -46,8 +46,6 @@ func (w *Window) OnReady(fn func()) {
 }
 
 // OnResize registers fn to be called whenever the window is resized.
-// width and height are the content-area dimensions in logical pixels
-// (excluding the native title bar on macOS).
 func (w *Window) OnResize(fn func(width, height int)) {
 	w.mu.Lock()
 	w.onResize = fn
@@ -76,7 +74,6 @@ func (w *Window) OnBlur(fn func()) {
 }
 
 // OnClose registers fn to be called when the user closes the window.
-// The window is destroyed by the host; perform any cleanup here.
 func (w *Window) OnClose(fn func()) {
 	w.mu.Lock()
 	w.onClose = fn
@@ -107,7 +104,7 @@ func (w *Window) OnTitleChange(fn func(title string)) {
 }
 
 // OnLoadStart registers fn to be called when the primary WebView begins
-// navigating to a new URL. Fired before any content is received.
+// navigating to a new URL.
 func (w *Window) OnLoadStart(fn func(url string)) {
 	w.mu.Lock()
 	w.onLoadStart = fn
@@ -123,7 +120,7 @@ func (w *Window) OnLoadFinish(fn func(url string)) {
 }
 
 // OnLoadFailed registers fn to be called when the primary WebView fails
-// to load a URL. errMsg contains a human-readable description.
+// to load a URL.
 func (w *Window) OnLoadFailed(fn func(url, errMsg string)) {
 	w.mu.Lock()
 	w.onLoadFailed = fn
@@ -168,7 +165,6 @@ func (w *Window) GoForward() {
 }
 
 // Eval executes js in the primary WebView's JavaScript context.
-// Results are discarded; use IPC if you need a return value.
 func (w *Window) Eval(js string) {
 	w.app.sendJSON(map[string]any{"type": "webview.eval", "id": w.webviewID, "js": js})
 }
@@ -304,16 +300,17 @@ func (w *Window) NewWebView(cfg webview.Config) *WebView {
 	w.app.mu.Unlock()
 
 	w.app.sendJSON(map[string]any{
-		"type":      "webview.create",
-		"id":        id,
-		"window_id": w.id,
-		"mode":      "view",
-		"x":         cfg.X,
-		"y":         cfg.Y,
-		"width":     width,
-		"height":    height,
-		"z":         cfg.ZOrder,
-		"devtools":  cfg.Debug,
+		"type":          "webview.create",
+		"id":            id,
+		"window_id":     w.id,
+		"mode":          "view",
+		"x":             cfg.X,
+		"y":             cfg.Y,
+		"width":         width,
+		"height":        height,
+		"z":             cfg.ZOrder,
+		"devtools":      cfg.Debug,
+		"resource_root": cfg.ResourceRoot, // ← NEW
 	})
 
 	return ov

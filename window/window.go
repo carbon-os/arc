@@ -17,4 +17,9 @@ type Config struct {
 	// Debug enables the WebView developer-tools panel.
 	// Useful during development; disable for production builds.
 	Debug bool
+
+	// ResourceRoot is the absolute path to the directory that the WebView's
+	// custom-scheme handler will serve files from (no trailing slash).
+	// Leave empty to disable local resource serving.
+	ResourceRoot string
 }

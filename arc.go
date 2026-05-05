@@ -464,11 +464,12 @@ func (a *App) newWindow(cfg wcfg.Config) *Window {
 	})
 
 	a.sendJSON(map[string]any{
-		"type":      "webview.create",
-		"id":        wvID,
-		"window_id": winID,
-		"mode":      "window",
-		"devtools":  cfg.Debug,
+		"type":          "webview.create",
+		"id":            wvID,
+		"window_id":     winID,
+		"mode":          "window",
+		"devtools":      cfg.Debug,
+		"resource_root": cfg.ResourceRoot, // ← NEW
 	})
 
 	return win

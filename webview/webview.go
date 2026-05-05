@@ -13,9 +13,13 @@ type Config struct {
 	Width, Height int
 
 	// ZOrder controls stacking order among overlays on the same window.
-	// Reserved for future use — not currently forwarded to the host.
 	ZOrder int
 
 	// Debug enables the WebView developer-tools panel.
 	Debug bool
+
+	// ResourceRoot is the absolute path to the directory that the WebView's
+	// custom-scheme handler will serve files from (no trailing slash).
+	// Leave empty to disable local resource serving.
+	ResourceRoot string
 }
